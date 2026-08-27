@@ -11,6 +11,12 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from pathlib import Path
+
+try:
+    from dotenv import load_dotenv as _load_dotenv
+except ImportError:  # 未安装 python-dotenv 时，回退到只使用真实环境变量
+    _load_dotenv = None
 
 
 @dataclass
@@ -18,6 +24,8 @@ class Config:
     """Agent 运行时配置。
 
     API Key 只能通过环境变量提供，绝不能硬编码进代码或仓库。
+    也支持从项目根目录的 .env 文件加载（.env 已被 .gitignore 忽略，
+    不会进入仓库），但 shell 中已导出的真实环境变量始终优先。
     """
 
     api_key: str = ""
@@ -37,7 +45,11 @@ class Config:
 
     @classmethod
     def from_env(cls) -> "Config":
-        """从环境变量构建配置。"""
+        """从环境变量（或 .env 文件）构建配置。"""
+        if _load_dotenv is not None:
+            # 项目根目录下的 .env；默认不覆盖 shell 中已导出的变量。
+            _load_dotenv(Path(__file__).resolve().parent / ".env")
+
         # 优先 OPENAI_API_KEY，兼容 DEEPSEEK_API_KEY 等常见命名。
         api_key = os.environ.get("OPENAI_API_KEY") or os.environ.get("DEEPSEEK_API_KEY") or ""
 
@@ -56,7 +68,8 @@ class Config:
     def ensure_api_key(self) -> None:
         if not self.api_key:
             raise RuntimeError(
-                "未找到 API Key。请先设置环境变量，例如：\n"
+                "未找到 API Key。请复制 .env.example 为 .env 并填入 key，"
+                "或设置环境变量，例如：\n"
                 "  export OPENAI_API_KEY=...   # 或 DEEPSEEK_API_KEY=...\n"
-                "凭据只走环境变量，不进入仓库。"
+                "凭据只走 .env / 环境变量，不进入仓库。"
             )

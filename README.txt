@@ -9,8 +9,9 @@
 
 ## 快速开始
 1. pip install -r requirements.txt
-2. 设置环境变量（凭据只走环境变量，不进入仓库）：
-   export OPENAI_API_KEY=...       # 或 DEEPSEEK_API_KEY
+2. 配置凭据（凭据只走 .env / 环境变量，不进入仓库）：
+   方式 A（推荐）：复制 .env.example 为 .env，填入 OPENAI_API_KEY
+   方式 B：export OPENAI_API_KEY=...   # 或 DEEPSEEK_API_KEY
    可选：OPENAI_BASE_URL / OPENAI_MODEL 切换 DeepSeek、Qwen 等兼容服务
 3. python main.py "修复 demo 项目中的 bug 并让所有测试通过"
    或运行 python main.py 进入交互模式
