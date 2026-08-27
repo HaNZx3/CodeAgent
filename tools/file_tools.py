@@ -61,7 +61,10 @@ class ListFilesTool(Tool):
                 continue
 
             indent = "  " * current_depth
-            lines.append(f"{indent}{Path(dirpath).name}/")
+            # 根目录显示为 "./"，与工具"相对 workspace"的路径约定对齐，
+            # 避免 LLM 把 workspace 名（如 demo/）当成路径前缀去 read_file。
+            name = "." if current_depth == 0 else Path(dirpath).name
+            lines.append(f"{indent}{name}/")
             for f in sorted(filenames):
                 if f.startswith(".") or f.endswith((".pyc", ".pyo")):
                     continue
