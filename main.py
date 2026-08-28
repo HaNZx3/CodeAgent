@@ -242,15 +242,12 @@ def _readline(prompt: str) -> str:
                     buf = prefix
                     sys.stdout.write(completion)
                     sys.stdout.flush()
-                sys.stdout.write("\n")
+                # 用 print 确保每行正确换行（write+\n 在部分终端下不可靠）
+                print()
                 for m in matches:
-                    sys.stdout.write(
-                        f"  {C.BOLD}{m:<12}{C.RESET}{C.GRAY}{COMMANDS[m]}{C.RESET}\n"
-                    )
-                sys.stdout.flush()
-                # 重写提示符 + 当前 buf，让用户继续输入缩小范围
-                sys.stdout.write(f"{prompt}{buf}")
-                sys.stdout.flush()
+                    print(f"  {C.CYAN}{m:<14}{C.RESET} {C.GRAY}{COMMANDS[m]}{C.RESET}")
+                # 重新显示提示符 + 当前 buf，让用户继续输入缩小范围
+                print(f"{prompt}{buf}", end="", flush=True)
         elif ch == "\x08":  # Backspace
             if buf:
                 buf = buf[:-1]
