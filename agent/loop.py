@@ -76,6 +76,9 @@ class AgentLoop:
         供 CLI 在工具执行期间显示 spinner 等加载状态。
         """
         self.context.add_user(task)
+        # 压缩在 stop.start() 之前：summarizer 的 LLM 调用不计入 max_runtime；
+        # 新 task 已在末尾，必然落在 recent 段不会被压缩掉。
+        self.context.maybe_compact()
         self.stop.start()
 
         consecutive_errors = 0
@@ -97,6 +100,12 @@ class AgentLoop:
                 response = self.llm.chat(
                     self.context.get_messages(), self.registry.schemas(), **kwargs
                 )
+                # 同步真实 prompt_tokens 给 context，下次 maybe_compact 据此判断阈值。
+                # 不估算——一切用 API 返回的真实 usage。用 getattr 兼容测试 mock
+                # 等未实现 last_usage 的 chat 实现（它们没有真实 usage 可同步）。
+                usage = getattr(self.llm, "last_usage", None)
+                if usage and "prompt_tokens" in usage:
+                    self.context.last_prompt_tokens = usage["prompt_tokens"]
             except Exception as exc:
                 return RunResult(
                     None,

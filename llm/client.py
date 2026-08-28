@@ -58,6 +58,9 @@ class LLMClient:
         if base_url:
             kwargs["base_url"] = base_url
         self._client = OpenAI(**kwargs)
+        # 上次调用的真实 token 用量（来自 API 返回的 usage 字段）。
+        # None 表示尚未调用过 LLM。/status 据此显示真实数据。
+        self.last_usage: dict | None = None
 
     def chat(
         self,
@@ -78,15 +81,24 @@ class LLMClient:
 
         if on_text is None:
             completion = self._create_with_retry(params)
+            self.last_usage = self._usage_to_dict(getattr(completion, "usage", None))
             message = completion.choices[0].message
             return self._normalize(message)
 
         # 流式：边收边转发文本增量，最后组装成与非流式相同的结构。
         params["stream"] = True
+        # 请求最后一个 chunk 携带真实 usage（OpenAI 兼容服务多数支持；
+        # 不支持时 chunk.usage 为 None，last_usage 保持上次值，不报错）。
+        params["stream_options"] = {"include_usage": True}
         text_parts: list[str] = []
         # 工具调用的 id/name 首包出现，arguments 可能拆成多个分片，按 index 归槽拼接。
         acc: dict[int, dict] = {}
+        stream_usage = None
         for chunk in self._create_with_retry(params):
+            # usage 可能出现在任意 chunk（通常最后一个），且该 chunk 可能无 choices。
+            chunk_usage = getattr(chunk, "usage", None)
+            if chunk_usage:
+                stream_usage = chunk_usage
             if not chunk.choices:
                 continue
             delta = chunk.choices[0].delta
@@ -104,6 +116,8 @@ class LLMClient:
                     slot["name"] = fn.name
                 if fn and fn.arguments:
                     slot["args"] += fn.arguments
+
+        self.last_usage = self._usage_to_dict(stream_usage)
 
         tool_calls: list[ToolCall] = []
         for _, slot in sorted(acc.items()):
@@ -133,6 +147,17 @@ class LLMClient:
                     raise
                 time.sleep(delay)
                 delay *= 2
+
+    @staticmethod
+    def _usage_to_dict(usage) -> dict | None:
+        """把 API 返回的 usage 对象转成 dict，便于 /status 展示真实数据。"""
+        if usage is None:
+            return None
+        return {
+            "prompt_tokens": getattr(usage, "prompt_tokens", 0) or 0,
+            "completion_tokens": getattr(usage, "completion_tokens", 0) or 0,
+            "total_tokens": getattr(usage, "total_tokens", 0) or 0,
+        }
 
     @staticmethod
     def _normalize(message) -> ModelResponse:

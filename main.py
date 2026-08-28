@@ -177,11 +177,15 @@ def _shorten(text: str, limit: int = 120) -> str:
 COMMANDS: dict[str, str] = {
     "/help": "显示可用命令",
     "/exit": "退出 Agent",
-    "/quit": "退出 Agent",
-    "/clear": "清空对话历史，重新开始",
+    "/clear": "开新会话（保留旧会话文件）",
+    "/new": "开新会话（可选名称 /new <name>）",
+    "/resume": "恢复历史会话 /resume <id>",
+    "/sessions": "列出当前 workspace 的所有会话",
+    "/delete": "删除会话：/delete <id> 或 /delete all",
+    "/compact": "手动压缩当前对话历史",
     "/model": "显示当前模型",
     "/workspace": "显示当前工作目录",
-    "/status": "显示对话历史长度",
+    "/status": "显示会话状态",
 }
 
 
@@ -295,38 +299,141 @@ def _handle_command(agent: CodingAgent, cmd: str, config: Config) -> bool:
     cmd = cmd.strip().lower()
     if not cmd.startswith("/"):
         return False
-    if cmd == "/help":
+    # 拆出子命令名和参数（参数可能含空格，故 maxsplit=1）。
+    parts = cmd.split(maxsplit=1)
+    name = parts[0]
+    arg = parts[1].strip() if len(parts) > 1 else ""
+
+    if name == "/help":
         print(f"{C.CYAN}可用命令：{C.RESET}")
-        for name, desc in COMMANDS.items():
-            print(f"  {C.BOLD}{name:<12}{C.RESET}{C.GRAY}{desc}{C.RESET}")
+        for n, d in COMMANDS.items():
+            print(f"  {C.BOLD}{n:<12}{C.RESET}{C.GRAY}{d}{C.RESET}")
         return True
-    if cmd in ("/exit", "/quit"):
+    if name == "/exit":
         raise _QuitRepl()
-    if cmd == "/clear":
-        agent.context.clear()
-        print(f"{C.GREEN}✓ 对话历史已清空，开启新对话{C.RESET}")
+    if name == "/clear":
+        agent.new_session()
+        print(f"{C.GREEN}✓ 已开新会话：{agent.session_id}{C.RESET}")
+        print(f"{C.GRAY}旧会话文件已保留，/sessions 可列出，/resume <id> 可恢复{C.RESET}")
         return True
-    if cmd == "/model":
+    if name == "/new":
+        sid = agent.new_session(arg or None)
+        print(f"{C.GREEN}✓ 新会话：{sid}{C.RESET}")
+        return True
+    if name == "/resume":
+        if not arg:
+            print(f"{C.RED}✗ 用法：/resume <session_id>{C.RESET}")
+            return True
+        try:
+            agent.switch_session(arg)
+        except Exception as e:
+            print(f"{C.RED}✗ 恢复失败：{e}{C.RESET}")
+            return True
+        history = agent.context.get_messages()
+        preview = ""
+        for m in history:
+            if m.get("role") == "user":
+                preview = (m.get("content", "") or "")[:60]
+                break
+        print(f"{C.GREEN}✓ 已恢复会话：{agent.session_id}{C.RESET}")
+        print(f"  {C.GRAY}历史消息{C.RESET}    {len(history)} 条")
+        if preview:
+            print(f"  {C.GRAY}首条任务{C.RESET}    {preview}")
+        return True
+    if name == "/sessions":
+        sessions = agent.store.list_sessions()
+        if not sessions:
+            print(f"{C.GRAY}（暂无会话记录）{C.RESET}")
+            return True
+        print(f"{C.CYAN}最近会话{C.RESET} {C.GRAY}（workspace: {config.workspace}）{C.RESET}")
+        for sid, preview, mtime in sessions:
+            mark = f"{C.GREEN}*{C.RESET}" if sid == agent.session_id else " "
+            ts = time.strftime("%Y-%m-%d %H:%M", time.localtime(mtime))
+            print(f"  {mark} {C.BOLD}{sid}{C.RESET}  {C.GRAY}{preview:<40}{ts}{C.RESET}")
+        print(f"{C.GRAY}用 /resume <id> 恢复某个会话{C.RESET}")
+        return True
+    if name == "/delete":
+        if not arg:
+            print(f"{C.RED}✗ 用法：/delete <id> 删除指定会话，或 /delete all 删除全部{C.RESET}")
+            return True
+        if arg == "all":
+            sessions = agent.store.list_sessions()
+            if not sessions:
+                print(f"{C.GRAY}（当前 workspace 无会话可删）{C.RESET}")
+                return True
+            # 批量删除不可逆，要求显式确认。
+            try:
+                confirm = input(
+                    f"{C.YELLOW}确认删除全部 {len(sessions)} 个会话？此操作不可逆 [y/N]{C.RESET} "
+                ).strip().lower()
+            except EOFError:
+                confirm = ""
+            if confirm != "y":
+                print(f"{C.GRAY}已取消{C.RESET}")
+                return True
+            n = agent.store.clear_all()
+            # 当前会话必被删，开新空会话避免内存 messages 与文件不一致。
+            new_id = agent.new_session()
+            print(f"{C.GREEN}✓ 已删除 {n} 个会话{C.RESET}")
+            print(f"{C.GRAY}当前会话也被删，已开新会话：{new_id}{C.RESET}")
+            return True
+        target = arg
+        if target == agent.session_id:
+            agent.store.clear(target)
+            new_id = agent.new_session()
+            print(f"{C.GREEN}✓ 已删除当前会话，已开新会话：{new_id}{C.RESET}")
+            return True
+        if not agent.store.path(target).exists():
+            print(f"{C.RED}✗ 会话 {target} 不存在{C.RESET}")
+            print(f"{C.GRAY}用 /sessions 查看可用会话{C.RESET}")
+            return True
+        agent.store.clear(target)
+        print(f"{C.GREEN}✓ 已删除会话：{target}{C.RESET}")
+        return True
+    if name == "/compact":
+        before = len(agent.context.get_messages())
+        agent.context.maybe_compact(force=True)
+        after = len(agent.context.get_messages())
+        print(f"{C.GREEN}✓ 压缩完成{C.RESET}  {C.GRAY}消息数 {before} -> {after}{C.RESET}")
+        return True
+    if name == "/model":
         print(f"  {C.GRAY}model{C.RESET}      {config.model}")
         return True
-    if cmd == "/workspace":
+    if name == "/workspace":
         print(f"  {C.GRAY}workspace{C.RESET}  {config.workspace}")
         return True
-    if cmd == "/status":
+    if name == "/status":
         n = len(agent.context.messages)
         print(f"  {C.GRAY}历史消息{C.RESET}    {n} 条")
+        usage = agent.llm.last_usage
+        if usage:
+            last = agent.context.last_prompt_tokens
+            status = (
+                "已超阈值"
+                if last is not None and last >= agent.context.compact_threshold
+                else "未触发"
+            )
+            print(f"  {C.GRAY}上次调用{C.RESET}    prompt {usage['prompt_tokens']}"
+                  f" + completion {usage['completion_tokens']}"
+                  f" = {usage['total_tokens']} tokens（{status}）")
+        else:
+            print(f"  {C.GRAY}上次调用{C.RESET}    尚未调用 LLM")
+        print(f"  {C.GRAY}当前会话{C.RESET}    {agent.session_id}")
+        print(f"  {C.GRAY}workspace{C.RESET}   {config.workspace}")
+        print(f"  {C.GRAY}压缩阈值{C.RESET}    {agent.context.compact_threshold:,}")
         return True
-    print(f"{C.RED}✗ 未知命令：{cmd}{C.RESET}  输入 {C.BOLD}/help{C.RESET} 查看可用命令")
+    print(f"{C.RED}✗ 未知命令：{name}{C.RESET}  输入 {C.BOLD}/help{C.RESET} 查看可用命令")
     return True
 
 
 # ── 启动横幅 ───────────────────────────────────────────────────────────────
 
 
-def _print_banner(config: Config) -> None:
+def _print_banner(agent: CodingAgent, config: Config) -> None:
     print(f"{C.CYAN}{C.BOLD}✦ CodeAgent{C.RESET}{C.GRAY} v0.2.0{C.RESET}")
     print(f"  {C.GRAY}workspace{C.RESET}  {config.workspace}")
     print(f"  {C.GRAY}model{C.RESET}      {config.model}")
+    print(f"  {C.GRAY}session{C.RESET}    {agent.session_id}")
     print()
 
 
@@ -360,7 +467,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"{C.RED}✗ {e}{C.RESET}", file=sys.stderr)
         return 1
 
-    _print_banner(config)
+    _print_banner(agent, config)
 
     if args.task:
         _run_once(agent, args.task)

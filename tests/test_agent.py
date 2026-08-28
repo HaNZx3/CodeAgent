@@ -244,3 +244,141 @@ def test_on_step_start_fires_with_tool_name_and_args():
     assert starts[0] == ("record", {"a": 1})
     assert tool.calls == [{"a": 1}]  # 工具确实被执行
     assert len(result.steps) == 1
+
+
+# ── Phase 1+2：上下文压缩与会话隔离集成 ──────────────────────────────────
+
+
+def test_maybe_compact_called_in_loop_before_llm():
+    """maybe_compact 应在第一次 chat 之前执行：第一次 chat 时 messages 已被压缩。"""
+    snapshots = []
+
+    class SnapshotLLM:
+        def chat(self, messages, tools=None):
+            snapshots.append([m.get("role") for m in messages])
+            return ModelResponse(text="final")
+
+    ctx = ContextManager("sys", compact_threshold=1, keep_recent=1,
+                         summarizer=lambda m: "SUMMARY")
+    ctx.add_user("t1")
+    ctx.add_assistant(ModelResponse(text="a1"))
+    ctx.add_user("t2")
+    ctx.add_assistant(ModelResponse(text="a2"))
+    ctx.last_prompt_tokens = 100  # 模拟上次调用真实 prompt_tokens 超阈值
+    loop = AgentLoop(SnapshotLLM(), ToolRegistry(), ctx, StopController(5, 10, 3))
+    loop.run("task3")
+
+    # 第一次 chat 时 messages 应已被压缩为：system + summary_system + user(task3)
+    assert len(snapshots) == 1
+    roles = snapshots[0]
+    assert roles == ["system", "system", "user"]
+    assert len(roles) == 3  # 压缩后只剩 3 条，证明 compact 在 chat 之前发生
+
+
+def test_loop_compact_does_not_count_toward_runtime():
+    """compact 在 stop.start() 之前，summarizer 耗时不计入 max_runtime。"""
+    import time
+
+    def slow_summarizer(m):
+        time.sleep(0.5)  # 模拟 summarizer 调 LLM 耗时
+        return "总结"
+
+    ctx = ContextManager("sys", compact_threshold=1, keep_recent=1,
+                         summarizer=slow_summarizer)
+    ctx.add_user("t1")
+    ctx.add_assistant(ModelResponse(text="a1"))
+    ctx.add_user("t2")
+    ctx.add_assistant(ModelResponse(text="a2"))
+    ctx.last_prompt_tokens = 100  # 模拟上次调用真实 prompt_tokens 超阈值，触发 compact
+    # max_runtime=0.2 < summarizer 耗时 0.5；若 compact 在 start 之后会立即超时
+    loop = AgentLoop(FakeLLM([ModelResponse(text="done")]), ToolRegistry(), ctx,
+                     StopController(5, 0.2, 3))
+    result = loop.run("task3")
+    # 应成功完成，而非因 runtime 超时
+    assert result.final_text == "done"
+    assert result.stop_reason is None
+
+
+def test_persisted_session_survives_new_context(tmp_path):
+    """跑一次 loop 后，用新 ContextManager 加载同一 session_id，历史应恢复。"""
+    from agent.session import SessionStore
+
+    store = SessionStore(tmp_path, "/ws")
+    ctx1 = ContextManager("sys", store=store, session_id="s1",
+                          compact_threshold=1_000_000, summarizer=lambda m: "S")
+    loop = AgentLoop(FakeLLM([ModelResponse(text="done")]), ToolRegistry(), ctx1,
+                     StopController(5, 10, 3))
+    loop.run("task1")
+
+    # session 文件应有内容
+    assert len(store.load("s1")) > 0
+
+    # 新 context 加载同一 session
+    ctx2 = ContextManager("sys", store=store, session_id="s1")
+    msgs = ctx2.get_messages()
+    # system + user(task1) + assistant(done) = 3
+    assert len(msgs) == 3
+    assert msgs[0]["role"] == "system"
+    assert msgs[1]["content"] == "task1"
+    assert msgs[2]["role"] == "assistant"
+    assert msgs[2]["content"] == "done"
+
+
+def test_agent_new_session_creates_empty_context(tmp_path):
+    """CodingAgent.new_session 后 context 只剩 system 消息。"""
+    from config import Config
+    from agent.agent import CodingAgent
+
+    config = Config(api_key="fake-key", workspace=str(tmp_path),
+                   session_root=str(tmp_path / "sessions"))
+    agent = CodingAgent(config)
+    old_sid = agent.session_id
+    new_sid = agent.new_session()
+    assert new_sid != old_sid
+    msgs = agent.context.get_messages()
+    assert len(msgs) == 1
+    assert msgs[0]["role"] == "system"
+
+
+def test_agent_switch_session_loads_history(tmp_path):
+    """CodingAgent.switch_session 到已有历史的 session_id，应加载历史消息。"""
+    from config import Config
+    from agent.agent import CodingAgent
+
+    config = Config(api_key="fake-key", workspace=str(tmp_path),
+                   session_root=str(tmp_path / "sessions"))
+    agent = CodingAgent(config)
+    # 预填一个 session 的历史
+    agent.store.append("predefined", {"role": "user", "content": "old task"})
+    agent.store.append("predefined", {"role": "assistant", "content": "old answer"})
+
+    agent.switch_session("predefined")
+    assert agent.session_id == "predefined"
+    msgs = agent.context.get_messages()
+    # system + user + assistant
+    assert len(msgs) == 3
+    assert msgs[1]["content"] == "old task"
+    assert msgs[2]["content"] == "old answer"
+    # loop 的 context 引用也必须同步更新
+    assert agent.loop.context is agent.context
+
+
+def test_fake_llm_as_summarizer():
+    """FakeLLM 返回固定文本作 summarizer，验证 summary 出现在 messages[1]。"""
+    summarizer_llm = FakeLLM([ModelResponse(text="这是历史总结")])
+
+    def summarizer(old_messages):
+        resp = summarizer_llm.chat([])
+        return resp.text or ""
+
+    ctx = ContextManager("sys", compact_threshold=1, keep_recent=1,
+                         summarizer=summarizer)
+    ctx.add_user("t1")
+    ctx.add_assistant(ModelResponse(text="a1"))
+    ctx.add_user("t2")
+    ctx.add_assistant(ModelResponse(text="a2"))
+    ctx.last_prompt_tokens = 100  # 模拟上次调用真实 prompt_tokens 超阈值
+    ctx.maybe_compact()
+    msgs = ctx.get_messages()
+    assert "这是历史总结" in msgs[1]["content"]
+    assert summarizer_llm.calls == 1  # summarizer LLM 被调用一次
