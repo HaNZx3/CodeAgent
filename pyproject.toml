@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "codeagent"
+version = "0.2.0"
+description = "自研 Coding Agent —— 从零实现的轻量级 Coding Agent，支持任意目录启动"
+requires-python = ">=3.10"
+dependencies = [
+    "openai>=1.30.0",
+    "python-dotenv>=1.0.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0.0"]
+
+# 注册全局命令：任意目录敲 codeagent 即可启动
+[project.scripts]
+codeagent = "main:main"
+
+[tool.setuptools]
+py-modules = ["main", "config"]
+packages = ["agent", "llm", "tools"]
