@@ -189,10 +189,26 @@ class _QuitRepl(Exception):
     """REPL 中收到退出命令时抛出，用于跨函数跳出循环。"""
 
 
+def _common_prefix(strings: list[str]) -> str:
+    """多个字符串的最长公共前缀，用于多匹配时补全到公共部分。"""
+    if not strings:
+        return ""
+    prefix = strings[0]
+    for s in strings[1:]:
+        while not s.startswith(prefix):
+            prefix = prefix[:-1]
+            if not prefix:
+                return ""
+    return prefix
+
+
 def _readline(prompt: str) -> str:
     """读取一行输入；Windows TTY 下支持 Tab 补全斜杠命令。
 
-    Tab 键补全到第一个匹配的命令前缀（如输入 /h 按 Tab 补全为 /help）；
+    Tab 补全规则（Claude Code 式）：
+      - 单匹配：直接补全为完整命令；
+      - 多匹配：补全到公共前缀，并在下方列出全部候选；
+      - 无匹配：不补全。
     非 TTY（管道/重定向）或非 Windows 回退到普通 input()，保证可移植。
     """
     if not (sys.platform == "win32" and sys.stdin.isatty()):
@@ -209,12 +225,31 @@ def _readline(prompt: str) -> str:
             sys.stdout.write("\n")
             return buf
         if ch == "\t":
-            # 补全到第一个匹配的命令，只追加补全部分（与普通输入一致）
             matches = [c for c in COMMANDS if c.startswith(buf)]
-            if matches:
+            if not matches:
+                continue
+            if len(matches) == 1:
+                # 单匹配：补全为完整命令，追加缺失字符
                 completion = matches[0][len(buf):]
                 buf = matches[0]
                 sys.stdout.write(completion)
+                sys.stdout.flush()
+            else:
+                # 多匹配：补全到公共前缀，并列出候选列表
+                prefix = _common_prefix(matches)
+                completion = prefix[len(buf):]
+                if completion:
+                    buf = prefix
+                    sys.stdout.write(completion)
+                    sys.stdout.flush()
+                sys.stdout.write("\n")
+                for m in matches:
+                    sys.stdout.write(
+                        f"  {C.BOLD}{m:<12}{C.RESET}{C.GRAY}{COMMANDS[m]}{C.RESET}\n"
+                    )
+                sys.stdout.flush()
+                # 重写提示符 + 当前 buf，让用户继续输入缩小范围
+                sys.stdout.write(f"{prompt}{buf}")
                 sys.stdout.flush()
         elif ch == "\x08":  # Backspace
             if buf:
