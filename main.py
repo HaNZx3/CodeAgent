@@ -171,6 +171,102 @@ def _shorten(text: str, limit: int = 120) -> str:
     return text[:limit] + "..."
 
 
+# ── 内置斜杠命令 ───────────────────────────────────────────────────────────
+
+
+COMMANDS: dict[str, str] = {
+    "/help": "显示可用命令",
+    "/exit": "退出 Agent",
+    "/quit": "退出 Agent",
+    "/clear": "清空对话历史，重新开始",
+    "/model": "显示当前模型",
+    "/workspace": "显示当前工作目录",
+    "/status": "显示对话历史长度",
+}
+
+
+class _QuitRepl(Exception):
+    """REPL 中收到退出命令时抛出，用于跨函数跳出循环。"""
+
+
+def _readline(prompt: str) -> str:
+    """读取一行输入；Windows TTY 下支持 Tab 补全斜杠命令。
+
+    Tab 键补全到第一个匹配的命令前缀（如输入 /h 按 Tab 补全为 /help）；
+    非 TTY（管道/重定向）或非 Windows 回退到普通 input()，保证可移植。
+    """
+    if not (sys.platform == "win32" and sys.stdin.isatty()):
+        return input(prompt)
+
+    import msvcrt
+
+    sys.stdout.write(prompt)
+    sys.stdout.flush()
+    buf = ""
+    while True:
+        ch = msvcrt.getwch()
+        if ch in ("\r", "\n"):
+            sys.stdout.write("\n")
+            return buf
+        if ch == "\t":
+            # 补全到第一个匹配的命令，只追加补全部分（与普通输入一致）
+            matches = [c for c in COMMANDS if c.startswith(buf)]
+            if matches:
+                completion = matches[0][len(buf):]
+                buf = matches[0]
+                sys.stdout.write(completion)
+                sys.stdout.flush()
+        elif ch == "\x08":  # Backspace
+            if buf:
+                buf = buf[:-1]
+                sys.stdout.write("\b \b")
+                sys.stdout.flush()
+        elif ch == "\x03":  # Ctrl+C
+            raise KeyboardInterrupt
+        elif ch == "\x1a":  # Ctrl+Z
+            raise EOFError
+        elif ch == "\xe0":  # 方向键/功能键前缀，丢弃下一个字节
+            msvcrt.getwch()
+        elif ch.isprintable():
+            buf += ch
+            sys.stdout.write(ch)
+            sys.stdout.flush()
+
+
+def _handle_command(agent: CodingAgent, cmd: str, config: Config) -> bool:
+    """处理斜杠内置命令。返回 True 表示已处理（不应发给 Agent）。
+
+    非斜杠开头返回 False，交给 Agent 作为任务处理；未知命令也算已处理
+    （给出提示，避免把 /xxx 当任务发给模型）。
+    """
+    cmd = cmd.strip().lower()
+    if not cmd.startswith("/"):
+        return False
+    if cmd == "/help":
+        print(f"{C.CYAN}可用命令：{C.RESET}")
+        for name, desc in COMMANDS.items():
+            print(f"  {C.BOLD}{name:<12}{C.RESET}{C.GRAY}{desc}{C.RESET}")
+        return True
+    if cmd in ("/exit", "/quit"):
+        raise _QuitRepl()
+    if cmd == "/clear":
+        agent.context.clear()
+        print(f"{C.GREEN}✓ 对话历史已清空，开启新对话{C.RESET}")
+        return True
+    if cmd == "/model":
+        print(f"  {C.GRAY}model{C.RESET}      {config.model}")
+        return True
+    if cmd == "/workspace":
+        print(f"  {C.GRAY}workspace{C.RESET}  {config.workspace}")
+        return True
+    if cmd == "/status":
+        n = len(agent.context.messages)
+        print(f"  {C.GRAY}历史消息{C.RESET}    {n} 条")
+        return True
+    print(f"{C.RED}✗ 未知命令：{cmd}{C.RESET}  输入 {C.BOLD}/help{C.RESET} 查看可用命令")
+    return True
+
+
 # ── 启动横幅 ───────────────────────────────────────────────────────────────
 
 
@@ -216,7 +312,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.task:
         _run_once(agent, args.task)
     else:
-        _run_repl(agent)
+        _run_repl(agent, config)
     return 0
 
 
@@ -234,16 +330,20 @@ def _run_once(agent: CodingAgent, task: str) -> None:
     )
 
 
-def _run_repl(agent: CodingAgent) -> None:
+def _run_repl(agent: CodingAgent, config: Config) -> None:
+    print(f"{C.GRAY}输入任务开始，/help 查看命令，/exit 退出{C.RESET}\n")
     while True:
         try:
-            task = input(f"{C.CYAN}❯ {C.RESET}").strip()
+            task = _readline(f"{C.CYAN}❯ {C.RESET}").strip()
         except (EOFError, KeyboardInterrupt):
             print(f"\n{C.GRAY}再见{C.RESET}")
             break
         if not task:
             continue
-        if task.lower() in {"exit", "quit", "q"}:
+        try:
+            if _handle_command(agent, task, config):
+                continue
+        except _QuitRepl:
             print(f"{C.GRAY}再见{C.RESET}")
             break
         print()

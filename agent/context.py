@@ -66,6 +66,15 @@ class ContextManager:
     def get_messages(self) -> list[dict]:
         return self.messages
 
+    def clear(self, system_prompt: str | None = None) -> None:
+        """清空对话历史。保留原 system prompt，或替换为新的。
+
+        用于交互式 REPL 中的 /clear 命令：让用户在不重启进程的情况下
+        开启全新对话，丢弃之前所有轮次（含工具输出）。
+        """
+        prompt = system_prompt if system_prompt is not None else self.messages[0]["content"]
+        self.messages = [{"role": "system", "content": prompt}]
+
     def _truncate(self, text: str) -> str:
         """超过上限时保留「前 6KB + 标记 + 后 2KB」（默认 8KB）。"""
         limit = self.max_tool_output

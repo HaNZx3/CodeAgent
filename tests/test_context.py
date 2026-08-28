@@ -48,3 +48,26 @@ def test_tool_output_truncated():
     content = cm.get_messages()[-1]["content"]
     assert len(content) < 1000
     assert "truncated" in content
+
+
+def test_clear_resets_to_system_prompt_only():
+    # /clear 命令依赖此方法：清空历史但保留 system prompt，开启新对话。
+    cm = ContextManager("sys")
+    cm.add_user("task1")
+    cm.add_assistant(ModelResponse(text="answer1"))
+    assert len(cm.get_messages()) == 3  # system + user + assistant
+
+    cm.clear()
+
+    msgs = cm.get_messages()
+    assert len(msgs) == 1
+    assert msgs[0] == {"role": "system", "content": "sys"}
+
+
+def test_clear_can_replace_system_prompt():
+    cm = ContextManager("old")
+    cm.add_user("x")
+    cm.clear("new system prompt")
+    msgs = cm.get_messages()
+    assert len(msgs) == 1
+    assert msgs[0]["content"] == "new system prompt"
