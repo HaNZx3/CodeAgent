@@ -32,7 +32,7 @@ class Config:
     base_url: str | None = None
     model: str = "gpt-4o-mini"
 
-    workspace: str = "./demo"
+    workspace: str = ""  # 空=用当前工作目录（Claude Code 式行为）
 
     # Agent Loop 停止条件（见 agent/stop.py）
     max_steps: int = 20
@@ -45,10 +45,20 @@ class Config:
 
     @classmethod
     def from_env(cls) -> "Config":
-        """从环境变量（或 .env 文件）构建配置。"""
+        """从环境变量（或 .env 文件）构建配置。
+
+        .env 加载顺序（后者覆盖前者，shell 环境变量始终最高优先级）：
+          1) 用户主目录 ~/.coding-agent/.env  —— 全局凭据，任意目录启动都能读到
+          2) 当前工作目录 ./                .env —— 项目本地可覆盖
+          3) 项目根目录（本文件所在目录）.env —— 兼容旧用法
+        这样 Agent 可像 Claude Code 一样在任意文件夹启动，凭据仍来自全局位置。
+        """
         if _load_dotenv is not None:
-            # 项目根目录下的 .env；默认不覆盖 shell 中已导出的变量。
-            _load_dotenv(Path(__file__).resolve().parent / ".env")
+            home_env = Path.home() / ".coding-agent" / ".env"
+            if home_env.exists():
+                _load_dotenv(home_env)
+            _load_dotenv(Path.cwd() / ".env", override=True)
+            _load_dotenv(Path(__file__).resolve().parent / ".env", override=True)
 
         # 优先 OPENAI_API_KEY，兼容 DEEPSEEK_API_KEY 等常见命名。
         api_key = os.environ.get("OPENAI_API_KEY") or os.environ.get("DEEPSEEK_API_KEY") or ""
@@ -57,7 +67,7 @@ class Config:
             api_key=api_key,
             base_url=os.environ.get("OPENAI_BASE_URL"),
             model=os.environ.get("OPENAI_MODEL", "gpt-4o-mini"),
-            workspace=os.environ.get("CODING_AGENT_WORKSPACE", "./demo"),
+            workspace=os.environ.get("CODING_AGENT_WORKSPACE", ""),
             max_steps=int(os.environ.get("CODING_AGENT_MAX_STEPS", "20")),
             max_runtime=float(os.environ.get("CODING_AGENT_MAX_RUNTIME", "300")),
             max_consecutive_errors=int(os.environ.get("CODING_AGENT_MAX_ERRORS", "3")),
