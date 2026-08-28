@@ -14,6 +14,8 @@
 from __future__ import annotations
 
 import json
+import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from openai import OpenAI
@@ -57,16 +59,80 @@ class LLMClient:
             kwargs["base_url"] = base_url
         self._client = OpenAI(**kwargs)
 
-    def chat(self, messages: list, tools: list | None = None) -> ModelResponse:
-        """调用模型并返回标准化响应。"""
+    def chat(
+        self,
+        messages: list,
+        tools: list | None = None,
+        on_text: Callable[[str], None] | None = None,
+    ) -> ModelResponse:
+        """调用模型并返回标准化响应。
+
+        on_text 提供时走流式接口：每个文本增量实时回调（打字机效果），
+        结束后仍返回完整统一的 ModelResponse；工具调用参数按分片拼装，
+        对上层完全透明——无论是否流式，Agent Loop 拿到的结构一模一样。
+        """
         params: dict = {"model": self.model, "messages": messages}
         if tools:
             params["tools"] = tools
             params["tool_choice"] = "auto"
 
-        completion = self._client.chat.completions.create(**params)
-        message = completion.choices[0].message
-        return self._normalize(message)
+        if on_text is None:
+            completion = self._create_with_retry(params)
+            message = completion.choices[0].message
+            return self._normalize(message)
+
+        # 流式：边收边转发文本增量，最后组装成与非流式相同的结构。
+        params["stream"] = True
+        text_parts: list[str] = []
+        # 工具调用的 id/name 首包出现，arguments 可能拆成多个分片，按 index 归槽拼接。
+        acc: dict[int, dict] = {}
+        for chunk in self._create_with_retry(params):
+            if not chunk.choices:
+                continue
+            delta = chunk.choices[0].delta
+            content = getattr(delta, "content", None)
+            if content:
+                text_parts.append(content)
+                on_text(content)
+            for frag in getattr(delta, "tool_calls", None) or []:
+                idx = getattr(frag, "index", 0)
+                slot = acc.setdefault(idx, {"id": "", "name": "", "args": ""})
+                if frag.id:
+                    slot["id"] = frag.id
+                fn = getattr(frag, "function", None)
+                if fn and fn.name:
+                    slot["name"] = fn.name
+                if fn and fn.arguments:
+                    slot["args"] += fn.arguments
+
+        tool_calls: list[ToolCall] = []
+        for _, slot in sorted(acc.items()):
+            try:
+                arguments = json.loads(slot["args"]) if slot["args"] else {}
+            except json.JSONDecodeError:
+                arguments = {}
+            tool_calls.append(ToolCall(id=slot["id"], name=slot["name"], arguments=arguments))
+        return ModelResponse(text="".join(text_parts) or None, tool_calls=tool_calls)
+
+    def _create_with_retry(self, params: dict, attempts: int = 3):
+        """带限流退避的 create 调用。
+
+        免费模型（如 GLM Flash 系列）高峰期常返回 429「访问量过大」，
+        对这类瞬时限流按 2s/4s/8s 指数退避重试；其他错误原样抛出。
+        """
+        delay = 2.0
+        for attempt in range(attempts):
+            try:
+                return self._client.chat.completions.create(**params)
+            except Exception as exc:
+                rate_limited = (
+                    type(exc).__name__ == "RateLimitError"
+                    or getattr(exc, "status_code", None) == 429
+                )
+                if not rate_limited or attempt == attempts - 1:
+                    raise
+                time.sleep(delay)
+                delay *= 2
 
     @staticmethod
     def _normalize(message) -> ModelResponse:

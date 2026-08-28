@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from llm.client import LLMClient
@@ -55,8 +56,21 @@ class AgentLoop:
         self.context = context
         self.stop = stop
 
-    def run(self, task: str) -> RunResult:
-        """执行一次完整任务，返回最终回答或停止原因。"""
+    def run(
+        self,
+        task: str,
+        on_step: Callable[[StepRecord], None] | None = None,
+        on_text: Callable[[str], None] | None = None,
+    ) -> RunResult:
+        """执行一次完整任务，返回最终回答或停止原因。
+
+        on_step 可选：每步工具执行完毕、以及模型在调用工具前给出的过程说明
+        时立即回调，供 CLI 实时渲染，而不是等整个 run 结束后一次性打印。
+        tool_name 为 None 的 StepRecord 表示模型的过程说明。
+
+        on_text 可选：开启流式。模型输出的文本增量实时转发（打字机效果）；
+        此时过程说明已通过流式渠道展示，不再走 on_step，避免重复打印。
+        """
         self.context.add_user(task)
         self.stop.start()
 
@@ -73,9 +87,11 @@ class AgentLoop:
                 )
 
             # 调用 LLM。LLM 出错时不直接崩溃，而是作为停止原因返回。
+            # FakeLLM 等自定义 chat 不认识 on_text 参数，仅在开启流式时才传。
             try:
+                kwargs = {"on_text": on_text} if on_text else {}
                 response = self.llm.chat(
-                    self.context.get_messages(), self.registry.schemas()
+                    self.context.get_messages(), self.registry.schemas(), **kwargs
                 )
             except Exception as exc:
                 return RunResult(
@@ -87,6 +103,16 @@ class AgentLoop:
             if response.has_tool_calls:
                 # 有工具调用：先把 assistant(tool_calls) 写入上下文，再逐个执行。
                 self.context.add_assistant(response)
+                # 模型常会在调工具的同时说一句过程说明（如「我先看看文件」），
+                # 把它也实时发出去，增强交互过程中的对话感。
+                # 流式模式下该文本已逐字展示过（on_text），跳过以免重复打印。
+                if response.text and on_step and on_text is None:
+                    on_step(
+                        StepRecord(
+                            step=step, tool_name=None, arguments=None,
+                            success=None, detail=response.text, duration_ms=0.0,
+                        )
+                    )
                 for call in response.tool_calls:
                     t0 = time.monotonic()
                     result = self.registry.execute(call.name, call.arguments)
@@ -101,16 +127,17 @@ class AgentLoop:
                         consecutive_errors += 1
                         detail = result.error or result.output or "unknown error"
 
-                    steps.append(
-                        StepRecord(
-                            step=step,
-                            tool_name=call.name,
-                            arguments=call.arguments,
-                            success=result.success,
-                            detail=detail,
-                            duration_ms=duration_ms,
-                        )
+                    rec = StepRecord(
+                        step=step,
+                        tool_name=call.name,
+                        arguments=call.arguments,
+                        success=result.success,
+                        detail=detail,
+                        duration_ms=duration_ms,
                     )
+                    steps.append(rec)
+                    if on_step:
+                        on_step(rec)
 
                     # 停止条件 4：连续工具失败
                     if self.stop.errors_exceeded(consecutive_errors):
@@ -121,7 +148,10 @@ class AgentLoop:
                             steps,
                         )
             else:
-                # 停止条件 1：模型给出最终回答
+                # 停止条件 1：模型给出最终回答。
+                # 必须把这条 assistant 消息写回上下文，否则多轮对话时
+                # 模型不记得自己上一轮给用户的总结说过什么。
+                self.context.add_assistant(response)
                 return RunResult(response.text or "", None, steps)
 
         # 停止条件 2：最大循环次数

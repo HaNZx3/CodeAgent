@@ -9,17 +9,37 @@ from __future__ import annotations
 
 import argparse
 import sys
+from pathlib import Path
 
 from config import Config
 from agent.agent import CodingAgent
-from agent.loop import RunResult
+from agent.loop import RunResult, StepRecord
 
 
-def render(result: RunResult) -> None:
-    """把 RunResult 渲染成便于观察 Agent 决策过程的日志。"""
-    for rec in result.steps:
+class _TurnView:
+    """一次 run() 的终端视图：模型文字逐字流出（打字机效果），
+    工具行与换行时机由本类统一调度，避免重复打印与粘连。"""
+
+    def __init__(self):
+        self._dirty = False  # 已有未收尾的流式输出
+
+    def text(self, delta: str) -> None:
+        sys.stdout.write(delta)
+        sys.stdout.flush()
+        self._dirty = True
+
+    def _newline(self) -> None:
+        if self._dirty:
+            print()
+            self._dirty = False
+
+    def step(self, rec: StepRecord) -> None:
+        self._newline()
         if rec.tool_name is None:
-            continue
+            note = _shorten(rec.detail.strip(), 300)
+            if note:
+                print(f"[Agent] {note}")
+            return
         status = "成功" if rec.success else "失败"
         args = _shorten(str(rec.arguments))
         print(f"[Tool] {rec.tool_name} {args}  ->  {status}  ({rec.duration_ms:.0f}ms)")
@@ -27,13 +47,16 @@ def render(result: RunResult) -> None:
         if detail:
             preview = "\n".join(detail.splitlines()[:6])
             print(f"       {_shorten(preview, 300)}")
-    print()
-    if result.final_text is not None:
-        print("[Agent] 任务完成")
-        print("-" * 40)
-        print(result.final_text)
-    else:
-        print(f"[Agent] 任务停止：{result.stop_reason}")
+
+    def finish(self, result: RunResult) -> None:
+        """收尾：最终回答已流式展示，这里只补换行和状态标记。"""
+        self._newline()
+        print()
+        if result.final_text is not None:
+            print("-" * 40)
+            print("[Agent] 任务完成")
+        else:
+            print(f"[Agent] 任务停止：{result.stop_reason}")
 
 
 def _shorten(text: str, limit: int = 120) -> str:
@@ -53,6 +76,10 @@ def main(argv: list[str] | None = None) -> int:
     config = Config.from_env()
     if args.workspace:
         config.workspace = args.workspace
+    elif not config.workspace:
+        # 不传 --workspace 且环境变量也没设时，绑定当前工作目录，
+        # 让 Agent 能像 Claude Code 一样在任意文件夹启动。
+        config.workspace = str(Path.cwd())
     if args.model:
         config.model = args.model
     if args.base_url:
@@ -78,7 +105,8 @@ def main(argv: list[str] | None = None) -> int:
 
 def _run_once(agent: CodingAgent, task: str) -> None:
     print(f"> {task}\n")
-    render(agent.run(task))
+    view = _TurnView()
+    view.finish(agent.run(task, on_step=view.step, on_text=view.text))
 
 
 def _run_repl(agent: CodingAgent) -> None:
@@ -90,10 +118,9 @@ def _run_repl(agent: CodingAgent) -> None:
             break
         if not task:
             continue
-        if task.lower() in {"exit", "quit", "q"}:
-            break
         print()
-        render(agent.run(task))
+        view = _TurnView()
+        view.finish(agent.run(task, on_step=view.step, on_text=view.text))
         print()
 
 

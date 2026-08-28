@@ -60,5 +60,5 @@ class CodingAgent:
         registry.register(ShellTool(self.workspace, self.config.command_timeout))
         return registry
 
-    def run(self, task: str) -> RunResult:
-        return self.loop.run(task)
+    def run(self, task: str, on_step=None, on_text=None) -> RunResult:
+        return self.loop.run(task, on_step=on_step, on_text=on_text)
