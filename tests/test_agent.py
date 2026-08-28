@@ -222,3 +222,25 @@ def test_streamed_final_answer_forwarded_and_written_back():
     assert result.final_text == "结论"
     assert ctx.get_messages()[-1]["role"] == "assistant"
     assert ctx.get_messages()[-1]["content"] == "结论"
+
+
+def test_on_step_start_fires_with_tool_name_and_args():
+    # on_step_start 在工具开始执行前回调，带工具名与参数，
+    # 供 CLI 在工具执行期间显示 spinner 等加载状态。
+    tool = RecordingTool()
+    registry = ToolRegistry()
+    registry.register(tool)
+
+    llm = FakeLLM([
+        ModelResponse(tool_calls=[ToolCall(id="1", name="record", arguments={"a": 1})]),
+        ModelResponse(text="完成"),
+    ])
+    starts: list = []
+    result = make_loop(llm, registry).run(
+        "task", on_step_start=lambda n, a: starts.append((n, a))
+    )
+
+    assert len(starts) == 1
+    assert starts[0] == ("record", {"a": 1})
+    assert tool.calls == [{"a": 1}]  # 工具确实被执行
+    assert len(result.steps) == 1

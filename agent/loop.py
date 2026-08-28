@@ -61,6 +61,7 @@ class AgentLoop:
         task: str,
         on_step: Callable[[StepRecord], None] | None = None,
         on_text: Callable[[str], None] | None = None,
+        on_step_start: Callable[[str, dict], None] | None = None,
     ) -> RunResult:
         """执行一次完整任务，返回最终回答或停止原因。
 
@@ -70,6 +71,9 @@ class AgentLoop:
 
         on_text 可选：开启流式。模型输出的文本增量实时转发（打字机效果）；
         此时过程说明已通过流式渠道展示，不再走 on_step，避免重复打印。
+
+        on_step_start 可选：工具开始执行前回调（带工具名与参数），
+        供 CLI 在工具执行期间显示 spinner 等加载状态。
         """
         self.context.add_user(task)
         self.stop.start()
@@ -114,6 +118,8 @@ class AgentLoop:
                         )
                     )
                 for call in response.tool_calls:
+                    if on_step_start:
+                        on_step_start(call.name, call.arguments)
                     t0 = time.monotonic()
                     result = self.registry.execute(call.name, call.arguments)
                     duration_ms = (time.monotonic() - t0) * 1000
