@@ -203,11 +203,12 @@ def _common_prefix(strings: list[str]) -> str:
 
 
 def _readline(prompt: str) -> str:
-    """读取一行输入；Windows TTY 下支持 Tab 补全斜杠命令。
+    """读取一行输入；Windows TTY 下支持实时补全预览（ghost text）。
 
-    Tab 补全规则（Claude Code 式）：
-      - 单匹配：直接补全为完整命令；
-      - 多匹配：补全到公共前缀，并在下方列出全部候选；
+    交互规则（Claude Code 式）：
+      - 输入过程中实时显示补全预览：单匹配时把补全部分以灰色显示在
+        光标后（如输入 /h 显示 /h + 灰色 elp），按 Tab 或回车即确认；
+      - 按 Tab：确认补全预览；若无预览且多匹配，在下方列出候选列表；
       - 无匹配：不补全。
     非 TTY（管道/重定向）或非 Windows 回退到普通 input()，保证可移植。
     """
@@ -216,43 +217,64 @@ def _readline(prompt: str) -> str:
 
     import msvcrt
 
+    buf = ""
+
+    def _ghost() -> str:
+        """当前 buf 的补全预览（单匹配时补全部分）。"""
+        if not buf:
+            return ""
+        matches = [c for c in COMMANDS if c.startswith(buf)]
+        if len(matches) == 1:
+            return matches[0][len(buf):]
+        return ""
+
+    def _refresh() -> None:
+        """重写输入行：prompt + buf + 灰色补全预览，光标停在 buf 末尾。"""
+        ghost = _ghost()
+        # \r 回行首；\033[K 清到行尾；重写整行
+        sys.stdout.write(f"\r\033[K{prompt}{buf}{C.GRAY}{ghost}{C.RESET}")
+        if ghost:
+            # 光标左移 ghost 长度，回到 buf 末尾（补全部分右侧）
+            sys.stdout.write(f"\033[{len(ghost)}D")
+        sys.stdout.flush()
+
     sys.stdout.write(prompt)
     sys.stdout.flush()
-    buf = ""
     while True:
         ch = msvcrt.getwch()
         if ch in ("\r", "\n"):
+            # 回车：若有补全预览则确认，再执行 buf
+            ghost = _ghost()
+            if ghost:
+                buf += ghost
             sys.stdout.write("\n")
             return buf
         if ch == "\t":
+            ghost = _ghost()
+            if ghost:
+                # 有预览：Tab 确认补全
+                buf += ghost
+                _refresh()
+                continue
+            # 无预览：尝试多匹配列候选
             matches = [c for c in COMMANDS if c.startswith(buf)]
             if not matches:
                 continue
             if len(matches) == 1:
-                # 单匹配：补全为完整命令，追加缺失字符
-                completion = matches[0][len(buf):]
                 buf = matches[0]
-                sys.stdout.write(completion)
-                sys.stdout.flush()
+                _refresh()
             else:
-                # 多匹配：补全到公共前缀，并列出候选列表
-                prefix = _common_prefix(matches)
-                completion = prefix[len(buf):]
-                if completion:
-                    buf = prefix
-                    sys.stdout.write(completion)
-                    sys.stdout.flush()
-                # 用 print 确保每行正确换行（write+\n 在部分终端下不可靠）
+                # 多匹配：补全到公共前缀，列出候选
+                buf = _common_prefix(matches)
                 print()
                 for m in matches:
                     print(f"  {C.CYAN}{m:<14}{C.RESET} {C.GRAY}{COMMANDS[m]}{C.RESET}")
-                # 重新显示提示符 + 当前 buf，让用户继续输入缩小范围
-                print(f"{prompt}{buf}", end="", flush=True)
+                sys.stdout.write(f"{prompt}{buf}")
+                sys.stdout.flush()
         elif ch == "\x08":  # Backspace
             if buf:
                 buf = buf[:-1]
-                sys.stdout.write("\b \b")
-                sys.stdout.flush()
+                _refresh()
         elif ch == "\x03":  # Ctrl+C
             raise KeyboardInterrupt
         elif ch == "\x1a":  # Ctrl+Z
@@ -261,8 +283,7 @@ def _readline(prompt: str) -> str:
             msvcrt.getwch()
         elif ch.isprintable():
             buf += ch
-            sys.stdout.write(ch)
-            sys.stdout.flush()
+            _refresh()
 
 
 def _handle_command(agent: CodingAgent, cmd: str, config: Config) -> bool:
