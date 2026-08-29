@@ -5,9 +5,6 @@
     代码约定、已知坑点等"项目记忆"放在 workspace/AGENT.md，每次 Agent
     启动自动注入 system prompt，无需用户重复交代。
     跨项目的个人偏好（编辑器、语言习惯）放 ~/.coding-agent/USER.md。
-
-    与 skills/ 的区别：skill 是行为指引（怎么用工具），memory 是事实约束
-    （这个项目用什么测试命令、有什么坑）。两者都拼到 system prompt。
 """
 
 from __future__ import annotations

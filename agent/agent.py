@@ -16,7 +16,6 @@ from tools.shell_tool import ShellTool
 from .context import ContextManager
 from .stop import StopController
 from .loop import AgentLoop, RunResult
-from .skill import load_skills
 from .session import SessionStore
 from .memory import load_project_memory
 
@@ -80,18 +79,16 @@ class CodingAgent:
         return self._session_id
 
     def _build_system_prompt(self) -> str:
-        """System Prompt 顺序：基础约束 + workspace 路径 + 项目记忆 + Skill 指引。
+        """System Prompt 顺序：基础约束 + workspace 路径 + 项目记忆。
 
         注入真实 workspace 路径，避免模型臆造为 /workspace。
-        项目级约束（AGENT.md）应在通用 skill 之前被模型读到。
+        项目级约束（AGENT.md）紧跟基础约束被模型读到。
         """
-        skills_dir = Path(__file__).resolve().parent.parent / "skills"
         ws = self.config.workspace or str(Path.cwd())
         return (
             SYSTEM_PROMPT
             + f"\n当前 workspace 路径：{ws}\n"
             + load_project_memory(self.config.workspace)
-            + load_skills(skills_dir)
         )
 
     def _make_context(self, session_id: str) -> ContextManager:

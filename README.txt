@@ -1,35 +1,104 @@
 # 自研 Coding Agent
 
-一个从零实现的轻量级编码智能体：调用大模型，自主读写本地项目文件、
-搜索代码、执行测试与命令，并根据结果迭代直到完成任务。
+一个从零实现的轻量级编程智能体（简化版 Claude Code）：调用大语言模型，
+自主读写本地文件、搜索代码、执行命令与测试，并根据执行结果迭代直到完成任务。
 
-核心的 Agent 运行逻辑（对话历史与上下文管理、工具定义与注册、工具调用解析、
-工具本地执行、Agent Loop、停止条件、错误恢复、Workspace 安全边界）全部自行实现，
-不依赖 LangChain / AutoGen / CrewAI 等任何 Agent 框架。
+核心 Agent 逻辑全部自行实现——对话历史与上下文管理、工具的定义与本地执行、
+模型输出（含流式分片）的解析、循环终止条件、错误恢复、Workspace 安全边界，
+不依赖 LangChain / LlamaIndex / OpenAI Agents SDK / AutoGen / CrewAI 等
+任何 Agent 框架或 SDK，仅使用 OpenAI 兼容 API 客户端与模型原生 tool calling。
+
+## 功能特性
+- Agent Loop 闭环：LLM -> 工具执行 -> 观测回传 -> 继续推理，直到给出最终回答
+- 六个本地工具：list_files / read_file / write_file / edit_file / search_code / run_command
+  （workspace 沙箱边界，拒绝越界访问）
+- 上下文自动压缩：真实 prompt_tokens 超阈值时把旧轮次摘要成一条 system 消息，
+  保留最近 N 轮原文；按 user 轮次切分，保证 tool_call/tool 消息配对完整
+- 会话持久化与隔离：每条消息同步落盘 JSONL，按 workspace 哈希分目录，
+  进程退出后可 /resume 恢复；原子重写（.tmp + os.replace）防崩溃损坏
+- 项目记忆：workspace/AGENT.md 与 ~/.coding-agent/USER.md 自动注入 system prompt
+- Claude Code 式用量显示：全部取自 API 返回的 usage 字段，无任何估算
+- 流式打字机输出、工具执行 spinner、斜杠命令 ghost text 实时补全
 
 ## 快速开始
-1. pip install -r requirements.txt
+1. 安装（可编辑安装会同时装好依赖，并注册 codeagent 全局命令）：
+   pip install -e ".[dev]"     # 含 pytest；只要运行依赖则 pip install -e .
 2. 配置凭据（凭据只走 .env / 环境变量，不进入仓库）：
    方式 A（推荐）：复制 .env.example 为 .env，填入 OPENAI_API_KEY
    方式 B：export OPENAI_API_KEY=...   # 或 DEEPSEEK_API_KEY
-   可选：OPENAI_BASE_URL / OPENAI_MODEL 切换 DeepSeek、Qwen 等兼容服务
-3. python main.py "修复 demo 项目中的 bug 并让所有测试通过"
-   或运行 python main.py 进入交互模式
+   可选：OPENAI_BASE_URL / OPENAI_MODEL 切换 DeepSeek、Qwen、GLM 等兼容服务
+   全局凭据建议放 ~/.coding-agent/.env（Windows: %USERPROFILE%\.coding-agent\.env），
+   任意目录启动都能读到；项目根 .env 可按项目覆盖
+3. 运行：
+   codeagent                                        # 任意目录直接启动交互模式
+   codeagent "修复 demo 项目中的 bug 并让所有测试通过"
+   codeagent --workspace ./demo "任务描述"          # 指定工作目录
+   （未安装时也可在项目目录内用 python main.py，参数完全一致）
+
+## 设计要点（核心逻辑说明，各文件 docstring 有完整动机）
+1. 对话历史与上下文管理（agent/context.py）
+   维护发给模型的 messages 列表；工具输出按「前 6KB + 标记 + 后 2KB」截断；
+   压缩判断用上次 API 返回的真实 prompt_tokens（不估算），摘要消息带幂等前缀防再压缩。
+2. 工具定义与本地执行（tools/）
+   Tool 基类用 JSON Schema 声明参数并自动生成 tool 定义；registry 统一分发；
+   工具失败不终止 Agent，而是把错误写回上下文让模型自行恢复。
+3. 模型输出解析（llm/client.py）
+   把各厂商响应标准化为 ModelResponse / ToolCall；流式模式下 tool_call 参数
+   分片按 index 拼槽，上层无感；usage 从最后一个 chunk 提取真实值。
+4. 循环终止条件（agent/stop.py）
+   四重停止：模型最终回答 / 最大步数 / 最大运行时间 / 连续工具失败；
+   压缩发生在计时开始前，summarizer 耗时不占 max_runtime。
+5. 错误恢复
+   LLM 异常作为停止原因返回而非崩溃；JSONL 损坏行跳过不影响整会话。
+
+## 交互命令
+/help            显示可用命令
+/new [名称]      开新会话（不传名称则自动生成 id）
+/resume <id>     恢复历史会话
+/sessions        列出当前 workspace 的所有会话
+/delete <id>     删除指定会话；/delete all 删除全部（需确认，删当前会话后自动开新）
+/clear           清空当前会话上下文（仅保留系统提示词，会话 id 不变）
+/compact         手动压缩当前对话历史
+/status          上下文占用（真实 tokens / 窗口 + 进度条）、距压缩余量、当前会话
+/model           显示当前模型
+/workspace       显示当前工作目录
+/exit            退出
+
+每次任务完成的收尾行附带真实用量：
+  ✓ 任务完成 · 上下文 930/128k (0.7%) · 本轮 2 次调用 1.1k tokens
+所有数字均来自 API 返回的 usage 字段。窗口大小用
+CODING_AGENT_CONTEXT_WINDOW 配置（默认 128000，仅用于显示，不参与压缩判断）。
+
+## 配置项（环境变量 / .env）
+OPENAI_API_KEY                  API Key（或 DEEPSEEK_API_KEY）
+OPENAI_BASE_URL                 OpenAI 兼容网关地址
+OPENAI_MODEL                    模型名（默认 gpt-4o-mini）
+CODING_AGENT_WORKSPACE          工作目录（默认绑定启动时的当前目录）
+CODING_AGENT_MAX_STEPS          单任务最大步数（默认 20）
+CODING_AGENT_MAX_RUNTIME        单任务最大运行秒数（默认 300）
+CODING_AGENT_MAX_ERRORS         最大连续工具失败次数（默认 3）
+CODING_AGENT_MAX_TOOL_OUTPUT    单条工具输出上限（默认 8192）
+CODING_AGENT_COMMAND_TIMEOUT    命令超时秒数（默认 30）
+CODING_AGENT_COMPACT_THRESHOLD  自动压缩阈值（默认 80000，按真实 prompt_tokens 判断）
+CODING_AGENT_KEEP_RECENT        压缩时保留最近轮数（默认 6）
+CODING_AGENT_CONTEXT_WINDOW     上下文窗口大小，仅用于占用显示（默认 128000）
+CODING_AGENT_SESSION_ROOT       会话文件根目录（默认 ~/.coding-agent/sessions）
 
 ## 目录结构
 agent/   Agent 状态与循环（loop / context / stop / session / memory）
-llm/     模型 API 通信
-tools/   工具定义与本地执行（file / search / shell）
+llm/     模型 API 通信与响应标准化
+tools/   工具定义与本地执行（file / search / shell / workspace 边界）
 demo/    演示用小型 Python 项目（含故意植入的 bug）
-tests/   自动化测试（tool / context / agent loop / session / memory）
+tests/   自动化测试（82 个：tool / context / agent loop / session / memory / 命令层）
 
 ## 运行测试
 pytest tests/
 
 ## 演示
 demo/calculator.py 的 multiply 函数有一个 bug（+ 应为 *）。
-让 Agent 执行「修复测试错误」，它会自动：list_files -> search_code ->
-read_file -> edit_file -> run_command(pytest) -> 失败后修复 -> 通过 -> 总结。
+让 Agent 执行「修复 demo 项目中的 bug 并让所有测试通过」，它会自动：
+list_files -> search_code -> read_file -> edit_file -> run_command(pytest)
+-> 根据失败继续修复 -> 通过 -> 总结。
 
 ## 项目记忆（可选）
 在 workspace 根目录放 AGENT.md，写入项目特定指引（构建命令、测试方式、
@@ -41,23 +110,6 @@ read_file -> edit_file -> run_command(pytest) -> 失败后修复 -> 通过 -> �
   - 测试：pytest tests/
   - 包管理：uv
   - 约定：所有函数加类型注解
-
-## 会话管理
-/new [名称]      开新会话（不传名称则自动生成 id）
-/resume <id>     恢复历史会话
-/sessions        列出当前 workspace 的所有会话
-/delete <id>     删除指定会话；/delete all 删除全部（删当前会话后自动开新）
-/compact         手动压缩当前对话历史
-/clear           清空当前会话上下文（仅保留系统提示词，会话 id 不变）
-/status          显示上下文占用（真实 tokens / 窗口 + 进度条）、距压缩余量、当前会话 id
-
-每次任务完成的收尾行附带真实用量（Claude Code 式）：
-  ✓ 任务完成 · 上下文 930/128k (0.7%) · 本轮 2 次调用 1.1k tokens
-所有数字均来自 API 返回的 usage 字段，不使用任何估算。
-模型上下文窗口可用 CODING_AGENT_CONTEXT_WINDOW 配置（默认 128000）。
-
-会话文件存于 ~/.coding-agent/sessions/{slug}-{hash}/{session_id}.jsonl
-进程退出后可 /resume <id> 恢复历史上下文。
 
 ## Git 仓库
 https://github.com/HaNZx3/CodeAgent
