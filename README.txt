@@ -48,8 +48,13 @@ read_file -> edit_file -> run_command(pytest) -> 失败后修复 -> 通过 -> �
 /sessions        列出当前 workspace 的所有会话
 /delete <id>     删除指定会话；/delete all 删除全部（删当前会话后自动开新）
 /compact         手动压缩当前对话历史
-/clear           开新会话（保留旧会话文件，可后续 /resume 回看）
-/status          显示消息数、真实 prompt_tokens、当前会话 id、压缩阈值
+/clear           清空当前会话上下文（仅保留系统提示词，会话 id 不变）
+/status          显示上下文占用（真实 tokens / 窗口 + 进度条）、距压缩余量、当前会话 id
+
+每次任务完成的收尾行附带真实用量（Claude Code 式）：
+  ✓ 任务完成 · 上下文 930/128k (0.7%) · 本轮 2 次调用 1.1k tokens
+所有数字均来自 API 返回的 usage 字段，不使用任何估算。
+模型上下文窗口可用 CODING_AGENT_CONTEXT_WINDOW 配置（默认 128000）。
 
 会话文件存于 ~/.coding-agent/sessions/{slug}-{hash}/{session_id}.jsonl
 进程退出后可 /resume <id> 恢复历史上下文。

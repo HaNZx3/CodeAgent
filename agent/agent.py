@@ -133,6 +133,14 @@ class CodingAgent:
         # loop 内部持有 context 引用，切换后必须同步更新。
         self.loop.context = self.context
 
+    def clear_context(self) -> None:
+        """原地清空当前会话上下文：仅保留 system prompt，会话 id 与文件同步清空。
+
+        与 new_session 的区别：不清空会话、不换 id，只抹掉对话历史
+        （/clear 命令）。system prompt 保持当前 workspace/记忆的最新值。
+        """
+        self.context.reset()
+
     def new_session(self, name: str | None = None) -> str:
         """开启新会话：生成新 session_id（或用 name 作为 id），切过去。
 

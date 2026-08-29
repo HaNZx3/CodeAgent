@@ -37,6 +37,9 @@ class RunResult:
     final_text: str | None
     stop_reason: str | None
     steps: list[StepRecord] = field(default_factory=list)
+    # 本次 run 期间 LLM 返回的真实用量累计（prompt/completion/total_tokens 与
+    # 调用次数 calls）。全部来自 API usage 字段，不估算；calls=0 表示没有成功调用。
+    usage: dict = field(default_factory=lambda: {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "calls": 0})
 
     @property
     def succeeded(self) -> bool:
@@ -83,14 +86,18 @@ class AgentLoop:
 
         consecutive_errors = 0
         steps: list[StepRecord] = []
+        # 本次 run 的真实用量累计；每个返回点统一经 _result 附加到 RunResult。
+        run_usage: dict = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "calls": 0}
+
+        def _result(final_text: str | None, stop_reason: str | None) -> RunResult:
+            return RunResult(final_text, stop_reason, steps, dict(run_usage))
 
         for step in range(1, self.stop.max_steps + 1):
             # 停止条件 3：最大运行时间
             if self.stop.runtime_exceeded():
-                return RunResult(
+                return _result(
                     None,
                     f"maximum runtime ({self.stop.max_runtime}s) exceeded",
-                    steps,
                 )
 
             # 调用 LLM。LLM 出错时不直接崩溃，而是作为停止原因返回。
@@ -106,11 +113,17 @@ class AgentLoop:
                 usage = getattr(self.llm, "last_usage", None)
                 if usage and "prompt_tokens" in usage:
                     self.context.last_prompt_tokens = usage["prompt_tokens"]
+                    # 累计本次 run 的真实用量（RunResult.usage 供收尾行显示）。
+                    p = usage.get("prompt_tokens", 0)
+                    c = usage.get("completion_tokens", 0)
+                    run_usage["prompt_tokens"] += p
+                    run_usage["completion_tokens"] += c
+                    run_usage["total_tokens"] += usage.get("total_tokens", p + c)
+                    run_usage["calls"] += 1
             except Exception as exc:
-                return RunResult(
+                return _result(
                     None,
                     f"LLM 调用失败: {type(exc).__name__}: {exc}",
-                    steps,
                 )
 
             if response.has_tool_calls:
@@ -156,22 +169,20 @@ class AgentLoop:
 
                     # 停止条件 4：连续工具失败
                     if self.stop.errors_exceeded(consecutive_errors):
-                        return RunResult(
+                        return _result(
                             None,
                             "maximum consecutive tool errors "
                             f"({self.stop.max_consecutive_errors}) reached",
-                            steps,
                         )
             else:
                 # 停止条件 1：模型给出最终回答。
                 # 必须把这条 assistant 消息写回上下文，否则多轮对话时
                 # 模型不记得自己上一轮给用户的总结说过什么。
                 self.context.add_assistant(response)
-                return RunResult(response.text or "", None, steps)
+                return _result(response.text or "", None)
 
         # 停止条件 2：最大循环次数
-        return RunResult(
+        return _result(
             None,
             f"maximum number of steps ({self.stop.max_steps}) reached",
-            steps,
         )

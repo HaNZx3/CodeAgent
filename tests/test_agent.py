@@ -382,3 +382,102 @@ def test_fake_llm_as_summarizer():
     msgs = ctx.get_messages()
     assert "这是历史总结" in msgs[1]["content"]
     assert summarizer_llm.calls == 1  # summarizer LLM 被调用一次
+
+
+# ── 真实用量统计（Claude Code 式 token 显示）──────────────────────────────
+
+
+class UsageLLM:
+    """按脚本顺序返回 (响应, (prompt, completion))；每次 chat 先设置 last_usage
+    再返回响应，模拟真实 API 在响应中携带 usage 字段的行为。
+    脚本耗尽后返回最终文本且 last_usage 置 None（模拟无 usage 的调用）。"""
+
+    def __init__(self, script):
+        self.script = list(script)
+        self.last_usage = None
+
+    def chat(self, messages, tools=None):
+        if not self.script:
+            self.last_usage = None
+            return ModelResponse(text="done")
+        response, (p, c) = self.script.pop(0)
+        self.last_usage = {"prompt_tokens": p, "completion_tokens": c, "total_tokens": p + c}
+        return response
+
+
+def _tool_call(i: int) -> ModelResponse:
+    return ModelResponse(tool_calls=[ToolCall(id=str(i), name="record", arguments={})])
+
+
+def test_runresult_usage_accumulates_real_tokens():
+    """一次 run 内多次 LLM 调用的 usage 应累计，且均为真实值。"""
+    registry = ToolRegistry()
+    registry.register(RecordingTool())
+    llm = UsageLLM([
+        (_tool_call(1), (100, 10)),
+        (_tool_call(2), (150, 20)),
+        (ModelResponse(text="done"), (200, 30)),
+    ])
+    loop = make_loop(llm, registry)
+
+    result = loop.run("task")
+
+    assert result.succeeded
+    assert result.usage["calls"] == 3
+    assert result.usage["prompt_tokens"] == 450
+    assert result.usage["completion_tokens"] == 60
+    assert result.usage["total_tokens"] == 510
+
+
+def test_context_reset_keeps_system_and_clears_file(tmp_path):
+    """ContextManager.reset：内存只留 system、last_prompt_tokens 归零、会话文件清空。"""
+    from agent.session import SessionStore
+
+    store = SessionStore(tmp_path, "/ws")
+    ctx = ContextManager("sys", store=store, session_id="s1",
+                         compact_threshold=1_000_000, summarizer=lambda m: "S")
+    ctx.add_user("t1")
+    ctx.add_assistant(ModelResponse(text="a1"))
+    ctx.last_prompt_tokens = 930
+    assert len(store.load("s1")) == 2  # 文件里有历史
+
+    ctx.reset()
+
+    assert len(ctx.messages) == 1
+    assert ctx.messages[0]["role"] == "system"
+    assert ctx.last_prompt_tokens is None
+    assert store.load("s1") == []  # 文件同步清空
+    # 清空后继续对话：消息正常追加、文件重建
+    ctx.add_user("t2")
+    assert [m["content"] for m in store.load("s1")] == ["t2"]
+
+
+def test_agent_clear_context_keeps_session_id(tmp_path):
+    """CodingAgent.clear_context：原地清空，会话 id 不变，历史全部移除。"""
+    from config import Config
+    from agent.agent import CodingAgent
+
+    config = Config(api_key="fake-key", workspace=str(tmp_path),
+                   session_root=str(tmp_path / "sessions"))
+    agent = CodingAgent(config)
+    agent.store.append(agent.session_id, {"role": "user", "content": "old"})
+    agent.context.add_assistant(ModelResponse(text="a"))
+    agent.context.last_prompt_tokens = 500
+
+    sid = agent.session_id
+    agent.clear_context()
+
+    assert agent.session_id == sid  # id 不变（与 /new 的区别）
+    assert len(agent.context.get_messages()) == 1
+    assert agent.context.get_messages()[0]["role"] == "system"
+    assert agent.context.last_prompt_tokens is None
+    assert agent.store.load(sid) == []
+
+
+def test_usage_absent_llm_yields_zero_usage():
+    """无 last_usage 的 chat 实现（如测试 mock）不报错，usage 保持全零。"""
+    llm = FakeLLM([ModelResponse(text="done")])
+    result = make_loop(llm, ToolRegistry()).run("task")
+    assert result.succeeded
+    assert result.usage["calls"] == 0
+    assert result.usage["prompt_tokens"] == 0

@@ -46,6 +46,9 @@ class Config:
     # 上下文自动压缩（Phase 1）
     compact_threshold: int = 80_000   # 上次 API 返回的真实 prompt_tokens 超此值时自动压缩历史
     keep_recent: int = 6             # 压缩时保留最近 N 轮（一轮=user+后续 assistant/tool）
+    # 模型上下文窗口大小（仅用于 /status 与回复后指示条的占用百分比显示，
+    # 不参与压缩判断——压缩只看 compact_threshold 与真实 prompt_tokens）
+    context_window: int = 128_000
 
     # 会话持久化（Phase 2）
     session_root: str = ""           # 空=~/.coding-agent/sessions
@@ -82,6 +85,7 @@ class Config:
             command_timeout=float(os.environ.get("CODING_AGENT_COMMAND_TIMEOUT", "30")),
             compact_threshold=int(os.environ.get("CODING_AGENT_COMPACT_THRESHOLD", "80000")),
             keep_recent=int(os.environ.get("CODING_AGENT_KEEP_RECENT", "6")),
+            context_window=int(os.environ.get("CODING_AGENT_CONTEXT_WINDOW", "128000")),
             session_root=os.environ.get("CODING_AGENT_SESSION_ROOT", ""),
         )
 

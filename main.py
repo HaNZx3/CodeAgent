@@ -107,9 +107,10 @@ class _TurnView:
     - 工具结束后显示颜色化的结果行，再重启「思考中」等待下一轮。
     """
 
-    def __init__(self):
+    def __init__(self, context_window: int = 128_000):
         self._dirty = False  # 已有未收尾的流式输出
         self._spinner = _Spinner()
+        self._context_window = context_window  # 占用百分比显示用（真实 usage / 配置窗口）
 
     def begin(self) -> None:
         """run() 开始时调用，启动思考 spinner。"""
@@ -154,15 +155,26 @@ class _TurnView:
             self._dirty = False
 
     def finish(self, result: RunResult) -> None:
-        """收尾：最终回答已流式展示，这里只补分隔与状态标记。"""
+        """收尾：最终回答已流式展示，这里只补一行收尾标记（含真实用量）。"""
         self._spinner.stop()
         self._newline()
         print()
+        # 真实用量并入状态行：prompt 取本次最后一次调用的值——最终回答后
+        # messages 不再变化，它就是当前上下文的真实规模。
+        u = result.usage
+        usage_part = ""
+        if u.get("calls"):
+            used = u["prompt_tokens"]
+            pct = used / self._context_window * 100 if self._context_window > 0 else 100.0
+            usage_part = (
+                f" · 上下文 {_fmt_tokens(used)}/{_fmt_tokens(self._context_window)}"
+                f" ({pct:.1f}%) · 本轮 {u['calls']} 次调用 {_fmt_tokens(u['total_tokens'])} tokens"
+            )
         if result.final_text is not None:
             print(f"{C.GREEN}{'─' * 40}{C.RESET}")
-            print(f"{C.GREEN}✓ 任务完成{C.RESET}")
+            print(f"{C.GREEN}✓ 任务完成{C.RESET}{C.GRAY}{usage_part}{C.RESET}")
         else:
-            print(f"{C.RED}✗ 任务停止：{result.stop_reason}{C.RESET}")
+            print(f"{C.RED}✗ 任务停止：{result.stop_reason}{C.RESET}{C.GRAY}{usage_part}{C.RESET}")
 
 
 def _shorten(text: str, limit: int = 120) -> str:
@@ -171,13 +183,34 @@ def _shorten(text: str, limit: int = 120) -> str:
     return text[:limit] + "..."
 
 
+def _fmt_tokens(n: int) -> str:
+    """Claude Code 式 token 缩写：930 -> '930'，12_800 -> '12.8k'，128_000 -> '128k'。"""
+    if n < 10_000:
+        return f"{n:,}"
+    k = n / 1000
+    s = f"{k:.1f}".rstrip("0").rstrip(".")
+    return f"{s}k"
+
+
+def _context_bar(used: int, window: int, width: int = 20) -> str:
+    """上下文占用进度条：按 used/window 比例填充，绿色<50% / 黄色<80% / 红色≥80%。"""
+    if window <= 0:
+        ratio = 1.0
+    else:
+        ratio = min(used / window, 1.0)
+    filled = round(ratio * width)
+    bar = "█" * filled + "░" * (width - filled)
+    color = C.GREEN if ratio < 0.5 else (C.YELLOW if ratio < 0.8 else C.RED)
+    return f"{color}{bar}{C.RESET}"
+
+
 # ── 内置斜杠命令 ───────────────────────────────────────────────────────────
 
 
 COMMANDS: dict[str, str] = {
     "/help": "显示可用命令",
     "/exit": "退出 Agent",
-    "/clear": "开新会话（保留旧会话文件）",
+    "/clear": "清空当前会话上下文（仅保留系统提示词，id 不变）",
     "/new": "开新会话（可选名称 /new <name>）",
     "/resume": "恢复历史会话 /resume <id>",
     "/sessions": "列出当前 workspace 的所有会话",
@@ -312,9 +345,11 @@ def _handle_command(agent: CodingAgent, cmd: str, config: Config) -> bool:
     if name == "/exit":
         raise _QuitRepl()
     if name == "/clear":
-        agent.new_session()
-        print(f"{C.GREEN}✓ 已开新会话：{agent.session_id}{C.RESET}")
-        print(f"{C.GRAY}旧会话文件已保留，/sessions 可列出，/resume <id> 可恢复{C.RESET}")
+        # 原地清空当前会话：id 不变，只抹掉对话历史（与 /new 开新会话区分）。
+        sid = agent.session_id
+        agent.clear_context()
+        print(f"{C.GREEN}✓ 已清空当前会话上下文：{sid}{C.RESET}")
+        print(f"{C.GRAY}仅保留系统提示词，历史已从内存与会话文件中移除{C.RESET}")
         return True
     if name == "/new":
         sid = agent.new_session(arg or None)
@@ -404,23 +439,26 @@ def _handle_command(agent: CodingAgent, cmd: str, config: Config) -> bool:
         return True
     if name == "/status":
         n = len(agent.context.messages)
+        window = config.context_window
         print(f"  {C.GRAY}历史消息{C.RESET}    {n} 条")
-        usage = agent.llm.last_usage
-        if usage:
-            last = agent.context.last_prompt_tokens
-            status = (
-                "已超阈值"
-                if last is not None and last >= agent.context.compact_threshold
-                else "未触发"
-            )
-            print(f"  {C.GRAY}上次调用{C.RESET}    prompt {usage['prompt_tokens']}"
-                  f" + completion {usage['completion_tokens']}"
-                  f" = {usage['total_tokens']} tokens（{status}）")
+        # 上下文占用：最后一次 API 返回的真实 prompt_tokens（= 当前 messages 规模）。
+        # 标签按终端等宽对齐：全角字占 2 列，「距自动压缩/本会话累计」5 个全角字后补 2 空格。
+        last = agent.context.last_prompt_tokens
+        if last is not None:
+            pct = last / window * 100 if window > 0 else 100.0
+            print(f"  {C.GRAY}上下文{C.RESET}      "
+                  f"{last:,} / {window:,} tokens ({pct:.1f}%)  {_context_bar(last, window)}")
+            remain = agent.context.compact_threshold - last
+            if remain > 0:
+                print(f"  {C.GRAY}距自动压缩{C.RESET}  "
+                      f"还剩 {remain:,} tokens（阈值 {agent.context.compact_threshold:,}）")
+            else:
+                print(f"  {C.GRAY}距自动压缩{C.RESET}  "
+                      f"已达阈值 {agent.context.compact_threshold:,}，下次任务开始时压缩")
         else:
-            print(f"  {C.GRAY}上次调用{C.RESET}    尚未调用 LLM")
+            print(f"  {C.GRAY}上下文{C.RESET}      尚未调用 LLM（窗口 {window:,} tokens）")
         print(f"  {C.GRAY}当前会话{C.RESET}    {agent.session_id}")
         print(f"  {C.GRAY}workspace{C.RESET}   {config.workspace}")
-        print(f"  {C.GRAY}压缩阈值{C.RESET}    {agent.context.compact_threshold:,}")
         return True
     print(f"{C.RED}✗ 未知命令：{name}{C.RESET}  输入 {C.BOLD}/help{C.RESET} 查看可用命令")
     return True
@@ -478,7 +516,7 @@ def main(argv: list[str] | None = None) -> int:
 
 def _run_once(agent: CodingAgent, task: str) -> None:
     print(f"{C.CYAN}❯ {C.RESET}{task}\n")
-    view = _TurnView()
+    view = _TurnView(agent.config.context_window)
     view.begin()
     view.finish(
         agent.run(
@@ -507,7 +545,7 @@ def _run_repl(agent: CodingAgent, config: Config) -> None:
             print(f"{C.GRAY}再见{C.RESET}")
             break
         print()
-        view = _TurnView()
+        view = _TurnView(config.context_window)
         view.begin()
         view.finish(
             agent.run(

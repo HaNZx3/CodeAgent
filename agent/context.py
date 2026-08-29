@@ -63,6 +63,18 @@ class ContextManager:
         if store is not None and session_id is not None:
             self.messages += store.load(session_id)
 
+    def reset(self) -> None:
+        """原地清空对话历史：仅保留 system 消息，会话 id 不变。
+
+        会话文件同步删除——否则内存已清空而文件还在，下次 add_user
+        会把新消息 append 到旧历史后面，/resume 会得到不一致的状态。
+        last_prompt_tokens 一并归零：清空后旧的真实用量不再代表当前上下文。
+        """
+        self.messages = [self.messages[0]]
+        self.last_prompt_tokens = None
+        if self.store is not None and self.session_id is not None:
+            self.store.clear(self.session_id)
+
     def add_user(self, text: str) -> None:
         msg = {"role": "user", "content": text}
         self.messages.append(msg)
