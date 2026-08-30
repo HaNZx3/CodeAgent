@@ -8,9 +8,12 @@
 from __future__ import annotations
 
 import argparse
+import re
+import shutil
 import sys
 import threading
 import time
+import unicodedata
 from pathlib import Path
 
 from config import Config
@@ -227,101 +230,187 @@ class _QuitRepl(Exception):
     """REPL 中收到退出命令时抛出，用于跨函数跳出循环。"""
 
 
-def _common_prefix(strings: list[str]) -> str:
-    """多个字符串的最长公共前缀，用于多匹配时补全到公共部分。"""
-    if not strings:
-        return ""
-    prefix = strings[0]
-    for s in strings[1:]:
-        while not s.startswith(prefix):
-            prefix = prefix[:-1]
-            if not prefix:
-                return ""
-    return prefix
+_ANSI_RE = re.compile(r"\033\[[0-9;]*[A-Za-z]")
 
 
-def _readline(prompt: str) -> str:
-    """读取一行输入；Windows TTY 下支持实时补全预览（ghost text）。
+def _visible(s: str) -> str:
+    """去掉 ANSI 转义序列，用于计算显示宽度。"""
+    return _ANSI_RE.sub("", s)
 
-    交互规则（Claude Code 式）：
-      - 输入过程中实时显示补全预览：单匹配时把补全部分以灰色显示在
-        光标后（如输入 /h 显示 /h + 灰色 elp），按 Tab 或回车即确认；
-      - 按 Tab：确认补全预览；若无预览且多匹配，在下方列出候选列表；
-      - 无匹配：不补全。
-    非 TTY（管道/重定向）或非 Windows 回退到普通 input()，保证可移植。
+
+def _disp_width(s: str) -> int:
+    """字符串的终端显示宽度：CJK 全角字符按 2 列计。"""
+    return sum(2 if unicodedata.east_asian_width(ch) in "FW" else 1 for ch in s)
+
+
+def _wtruncate(text: str, budget: int) -> str:
+    """按显示宽度截断（CJK 感知），超预算以 … 结尾。"""
+    if _disp_width(text) <= budget:
+        return text
+    out, w = "", 0
+    for ch in text:
+        cw = 2 if unicodedata.east_asian_width(ch) in "FW" else 1
+        if w + cw > budget - 1:
+            return out + "…"
+        out += ch
+        w += cw
+    return out
+
+
+def _cursor_row() -> int | None:
+    """DSR（\033[6n）查询光标所在行；短时间无响应返回 None。
+
+    用于菜单打开前的滚屏预留。查询走 stdin 回读，用 kbhit + 截止时间
+    防止在不响应 DSR 的终端上永久阻塞。
+    """
+    if not (sys.platform == "win32" and sys.stdin.isatty()):
+        return None
+    import msvcrt
+
+    sys.stdout.write("\033[6n")
+    sys.stdout.flush()
+    deadline = time.time() + 0.2
+    resp = ""
+    while time.time() < deadline:
+        if msvcrt.kbhit():
+            resp += msvcrt.getwch()
+            if resp.endswith("R"):
+                m = re.search(r"(\d+);\d+R", resp)
+                return int(m.group(1)) if m else None
+        else:
+            time.sleep(0.01)
+    return None
+
+
+def _readline(prompt: str, status=None) -> str:
+    """读取一行输入（Claude Code 式交互）。
+
+    Windows TTY 下：
+      - 输入以 / 开头时，输入栏下方实时弹出命令菜单：按前缀过滤、
+        精确匹配置顶，↑/↓ 选择，Tab 补全，Enter 补全并执行；单匹配
+        时另有灰色 ghost 预览；Esc 关闭菜单，继续输入自动重新打开；
+      - 输入栏右下角常驻状态文本（status 回调提供，来自真实 API usage）；
+      - 打开输入行前用 DSR 查询光标行，过低则先滚屏预留出最大菜单的
+        空间，保证菜单绘制不会越过屏幕底边覆盖输入行。
+    非 TTY / 非 Windows 回退普通 input()，保证可移植。
     """
     if not (sys.platform == "win32" and sys.stdin.isatty()):
         return input(prompt)
 
     import msvcrt
 
+    prompt_w = _disp_width(_visible(prompt))
+    term_w = shutil.get_terminal_size().columns
+    term_h = shutil.get_terminal_size().lines
     buf = ""
+    sel = 0            # 菜单当前选中项
+    esc_closed = False  # Esc 后暂时关闭菜单，直到输入变化
+
+    def _matches() -> list[str]:
+        if not buf.startswith("/") or " " in buf:
+            return []
+        exact = [c for c in COMMANDS if c == buf]
+        return exact + [c for c in COMMANDS if c != buf and c.startswith(buf)]
 
     def _ghost() -> str:
-        """当前 buf 的补全预览（单匹配时补全部分）。"""
-        if not buf:
+        ms = _matches()
+        if esc_closed or len(ms) != 1:
             return ""
-        matches = [c for c in COMMANDS if c.startswith(buf)]
-        if len(matches) == 1:
-            return matches[0][len(buf):]
-        return ""
+        return ms[0][len(buf):]
 
-    def _refresh() -> None:
-        """重写输入行：prompt + buf + 灰色补全预览，光标停在 buf 末尾。"""
+    def _corner() -> str:
+        """右下角常驻状态；输入行右侧放不下时省略。"""
+        if status is None:
+            return ""
+        text = status()
+        if not text:
+            return ""
+        used = prompt_w + _disp_width(buf) + _disp_width(_ghost())
+        pad = term_w - used - _disp_width(_visible(text)) - 2
+        if pad < 2:
+            return ""
+        return " " * pad + C.GRAY + text + C.RESET
+
+    def _draw() -> None:
+        """重绘输入行 + 菜单；光标回到 buf 末尾。"""
+        ms = [] if esc_closed else _matches()
         ghost = _ghost()
-        # \r 回行首；\033[K 清到行尾；重写整行
-        sys.stdout.write(f"\r\033[K{prompt}{buf}{C.GRAY}{ghost}{C.RESET}")
+        col = 1 + prompt_w + _disp_width(buf)
+        out = ["\r\033[K", prompt, buf]
         if ghost:
-            # 光标左移 ghost 长度，回到 buf 末尾（补全部分右侧）
-            sys.stdout.write(f"\033[{len(ghost)}D")
+            out += [C.GRAY, ghost, C.RESET]
+        out.append(_corner())
+        sys.stdout.write("".join(out))
+        if ms:
+            for i, cmd in enumerate(ms):
+                desc = _wtruncate(COMMANDS[cmd], term_w - 16)
+                if i == sel:
+                    row = (f"{C.BOLD}{C.CYAN}❯ {cmd}{C.RESET}"
+                           f" {C.GRAY}{desc}{C.RESET}")
+                else:
+                    row = f"{C.GRAY}  {cmd}  {desc}{C.RESET}"
+                sys.stdout.write(f"\033[B\r\033[K{row}")
+        # 清掉比上一帧多出来的菜单行（\033[J 从光标清到屏幕尾）
+        sys.stdout.write("\033[B\r\033[J")
+        sys.stdout.write(f"\r\033[{len(ms) + 1}A\033[{col}G")
         sys.stdout.flush()
 
     sys.stdout.write(prompt)
     sys.stdout.flush()
+    # 菜单预留：光标行过低时先滚屏，保证最大菜单不会越过屏幕底边。
+    # 固定发 N 个换行：光标先走到屏幕底，之后的每个 \n 精确滚 1 行，
+    # 恰好滚到「输入行落在倒数第 N 行」，菜单空间即腾出。
+    row = _cursor_row()
+    if row is not None and row > term_h - (len(COMMANDS) + 1):
+        sys.stdout.write("\n" * (len(COMMANDS) + 1))
+        sys.stdout.write(f"\r\033[{len(COMMANDS) + 1}A")
+        sys.stdout.flush()
+    _draw()
+
     while True:
+        ms = [] if esc_closed else _matches()
         ch = msvcrt.getwch()
         if ch in ("\r", "\n"):
-            # 回车：若有补全预览则确认，再执行 buf
-            ghost = _ghost()
-            if ghost:
-                buf += ghost
-            sys.stdout.write("\n")
+            # 回车：菜单打开时补全选中命令并执行
+            if ms:
+                buf = ms[min(sel, len(ms) - 1)]
+            sys.stdout.write("\r\033[K" + prompt + buf + "\n\033[J")
+            sys.stdout.flush()
             return buf
         if ch == "\t":
-            ghost = _ghost()
-            if ghost:
-                # 有预览：Tab 确认补全
-                buf += ghost
-                _refresh()
-                continue
-            # 无预览：尝试多匹配列候选
-            matches = [c for c in COMMANDS if c.startswith(buf)]
-            if not matches:
-                continue
-            if len(matches) == 1:
-                buf = matches[0]
-                _refresh()
-            else:
-                # 多匹配：补全到公共前缀，列出候选
-                buf = _common_prefix(matches)
-                print()
-                for m in matches:
-                    print(f"  {C.CYAN}{m:<14}{C.RESET} {C.GRAY}{COMMANDS[m]}{C.RESET}")
-                sys.stdout.write(f"{prompt}{buf}")
-                sys.stdout.flush()
-        elif ch == "\x08":  # Backspace
+            if ms:
+                buf = ms[min(sel, len(ms) - 1)]
+                sel = 0
+                _draw()
+        elif ch == "\x08" or ch == "\x7f":  # Backspace
             if buf:
                 buf = buf[:-1]
-                _refresh()
+                esc_closed = False
+                sel = 0
+                _draw()
         elif ch == "\x03":  # Ctrl+C
+            sys.stdout.write("\033[B\r\033[J")
             raise KeyboardInterrupt
         elif ch == "\x1a":  # Ctrl+Z
+            sys.stdout.write("\033[B\r\033[J")
             raise EOFError
-        elif ch == "\xe0":  # 方向键/功能键前缀，丢弃下一个字节
-            msvcrt.getwch()
+        elif ch == "\x1b":  # Esc：关闭菜单
+            if ms:
+                esc_closed = True
+                _draw()
+        elif ch in ("\xe0", "\x00"):  # 方向键/功能键前缀
+            nxt = msvcrt.getwch()
+            if nxt == "H" and ms:  # ↑
+                sel = max(sel - 1, 0)
+                _draw()
+            elif nxt == "P" and ms:  # ↓
+                sel = min(sel + 1, len(ms) - 1)
+                _draw()
         elif ch.isprintable():
             buf += ch
-            _refresh()
+            esc_closed = False
+            sel = 0
+            _draw()
 
 
 def _handle_back(agent: CodingAgent, arg: str) -> None:
@@ -657,9 +746,22 @@ def _run_once(agent: CodingAgent, task: str) -> None:
 
 def _run_repl(agent: CodingAgent, config: Config) -> None:
     print(f"{C.GRAY}输入任务开始，/help 查看命令，/exit 退出{C.RESET}\n")
+    # 输入栏右下角常驻状态的数据：全部取自 API 返回的真实 usage。
+    # ctx = 最近一次调用的 prompt_tokens（即当前上下文规模），
+    # total = 本会话累计消耗 tokens。
+    usage = {"ctx": 0, "total": 0}
+
+    def _corner() -> str:
+        if not usage["ctx"]:
+            return ""
+        win = config.context_window
+        pct = usage["ctx"] / win * 100 if win > 0 else 0.0
+        return (f"⏵ {_fmt_tokens(usage['ctx'])}/{_fmt_tokens(win)}"
+                f" · {pct:.1f}% · 累计 {_fmt_tokens(usage['total'])} tokens")
+
     while True:
         try:
-            task = _readline(f"{C.CYAN}❯ {C.RESET}").strip()
+            task = _readline(f"{C.CYAN}❯ {C.RESET}", status=_corner).strip()
         except (EOFError, KeyboardInterrupt):
             print(f"\n{C.GRAY}再见{C.RESET}")
             break
@@ -674,14 +776,17 @@ def _run_repl(agent: CodingAgent, config: Config) -> None:
         print()
         view = _TurnView(config.context_window)
         view.begin()
-        view.finish(
-            agent.run(
-                task,
-                on_step=view.step,
-                on_text=view.text,
-                on_step_start=view.step_start,
-            )
+        result = agent.run(
+            task,
+            on_step=view.step,
+            on_text=view.text,
+            on_step_start=view.step_start,
         )
+        view.finish(result)
+        u = result.usage
+        if u.get("calls"):
+            usage["ctx"] = u["prompt_tokens"]
+            usage["total"] += u["total_tokens"]
         print()
 
 

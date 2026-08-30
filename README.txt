@@ -21,7 +21,9 @@
   还原前自动安全快照，还原本身永远可撤销
 - 项目记忆：workspace/AGENT.md 与 ~/.coding-agent/USER.md 自动注入 system prompt
 - Claude Code 式用量显示：全部取自 API 返回的 usage 字段，无任何估算
-- 流式打字机输出、工具执行 spinner、斜杠命令 ghost text 实时补全
+- Claude Code 式输入体验：输入 / 弹出命令菜单（前缀过滤、精确匹配置顶、
+  ↑/↓ 选择、Tab/Enter 补全），输入栏右下角常驻真实用量；流式打字机输出、
+  工具执行 spinner
 
 ## 快速开始
 1. 安装（可编辑安装会同时装好依赖，并注册 codeagent 全局命令）：
@@ -72,6 +74,7 @@
 
 每次任务完成的收尾行附带真实用量：
   ✓ 任务完成 · 上下文 930/128k (0.7%) · 本轮 2 次调用 1.1k tokens
+输入栏右下角同时常驻显示当前上下文占用与本会话累计 tokens（无任务前不显示）。
 所有数字均来自 API 返回的 usage 字段。窗口大小用
 CODING_AGENT_CONTEXT_WINDOW 配置（默认 128000，仅用于显示，不参与压缩判断）。
 
