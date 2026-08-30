@@ -17,6 +17,17 @@ import re
 from pathlib import Path
 
 
+def workspace_slug(workspace: str) -> str:
+    """workspace -> 「可读片段-sha1前12位」目录名。
+
+    SessionStore（会话文件）与 CheckpointStore（代码快照）共用同一规则，
+    保证同一 workspace 的两类数据落在同一子目录、可按目录互相发现。
+    """
+    h = hashlib.sha1(workspace.encode("utf-8")).hexdigest()[:12]
+    slug = re.sub(r"[^A-Za-z0-9]+", "-", workspace).strip("-")[:30] or "default"
+    return f"{slug}-{h}"
+
+
 class SessionStore:
     """以 jsonl 文件持久化会话消息。
 
@@ -30,14 +41,7 @@ class SessionStore:
         self._dir = self._compute_dir()
 
     def _compute_dir(self) -> Path:
-        """workspace -> {root}/{slug}-{sha12}。
-
-        slug 取 workspace 路径的可读片段（最多 30 字符），sha12 是 sha1 前 12 位，
-        保证不同 workspace 目录不冲突且人眼可读。
-        """
-        h = hashlib.sha1(self.workspace.encode("utf-8")).hexdigest()[:12]
-        slug = re.sub(r"[^A-Za-z0-9]+", "-", self.workspace).strip("-")[:30] or "default"
-        return self.root / f"{slug}-{h}"
+        return self.root / workspace_slug(self.workspace)
 
     def path(self, session_id: str) -> Path:
         return self._dir / f"{session_id}.jsonl"

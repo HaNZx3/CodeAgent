@@ -1,5 +1,7 @@
 """ContextManager 单元测试。"""
 
+import pytest
+
 from llm.client import ModelResponse, ToolCall
 from tools.base import ToolResult
 from agent.context import ContextManager
@@ -284,3 +286,102 @@ def test_persisted_messages_on_add_tool_result(tmp_path):
     assert loaded[1]["role"] == "tool"
     assert loaded[1]["tool_call_id"] == "c1"
     assert loaded[1]["content"] == "data"
+
+
+# ── Phase 4：对话回退（/back） ────────────────────────────────────────────
+
+
+def _seed_two_turns(cm):
+    cm.add_user("t1")
+    cm.add_assistant(ModelResponse(text="a1"))
+    cm.add_user("t2")
+    cm.add_assistant(ModelResponse(text="a2"))
+
+
+def test_user_turns_lists_user_message_indices():
+    cm = ContextManager("sys")
+    _seed_two_turns(cm)
+    assert cm.user_turns() == [1, 3]
+
+
+def test_user_turns_excludes_summary_message():
+    """历史摘要（role=system）不是回退点：其替换的轮次已物理删除。"""
+    cm = ContextManager("sys", compact_threshold=1, keep_recent=1,
+                        summarizer=lambda m: "S")
+    _seed_two_turns(cm)
+    cm.last_prompt_tokens = 100
+    cm.maybe_compact()
+    # messages: [system, summary, t2, a2] -> 只剩 t2 可回退
+    assert cm.user_turns() == [2]
+
+
+def test_rewind_to_later_turn_keeps_earlier(tmp_path):
+    from agent.session import SessionStore
+    store = SessionStore(tmp_path, "/ws")
+    cm = ContextManager("sys", store=store, session_id="s1")
+    _seed_two_turns(cm)
+
+    removed = cm.rewind_to(3)  # 回退到 t2 之前
+
+    assert removed == 2
+    assert [m["content"] for m in cm.messages[1:]] == ["t1", "a1"]
+    assert [m["content"] for m in store.load("s1")] == ["t1", "a1"]
+    # 回退后继续对话：正常追加，文件一致
+    cm.add_user("t3")
+    assert store.load("s1")[-1]["content"] == "t3"
+
+
+def test_rewind_to_first_turn_clears_all_and_persists(tmp_path):
+    from agent.session import SessionStore
+    store = SessionStore(tmp_path, "/ws")
+    cm = ContextManager("sys", store=store, session_id="s1")
+    _seed_two_turns(cm)
+
+    assert cm.rewind_to(1) == 4
+    assert cm.messages == [{"role": "system", "content": "sys"}]
+    assert store.load("s1") == []
+
+
+def test_rewind_invalid_index_raises():
+    """回退点必须是 user_turns() 中的索引：防止留下孤儿 tool_call。"""
+    cm = ContextManager("sys")
+    cm.add_user("t1")
+    cm.add_assistant(ModelResponse(text="a1"))
+    for bad in (0, 2, 99, -1):
+        with pytest.raises(ValueError):
+            cm.rewind_to(bad)
+
+
+def test_rewind_resets_last_prompt_tokens():
+    """回退后旧的真实用量不再代表当前上下文，必须置空防误触发压缩。"""
+    cm = ContextManager("sys", compact_threshold=1, keep_recent=1,
+                        summarizer=lambda m: "SHOULD_NOT_APPEAR")
+    _seed_two_turns(cm)
+    cm.last_prompt_tokens = 100_000
+    cm.rewind_to(3)
+    assert cm.last_prompt_tokens is None
+    cm.maybe_compact()  # None -> 不压缩
+    assert len(cm.messages) == 3  # [sys, t1, a1]，未被压缩
+
+
+def test_maybe_compact_notifies_pruned_user_turns():
+    """压缩丢弃旧轮次时回调通知（供快照账本同步修剪）。"""
+    pruned = []
+    cm = ContextManager("sys", compact_threshold=1, keep_recent=1,
+                        summarizer=lambda m: "S", on_user_turns_pruned=pruned.append)
+    _seed_two_turns(cm)
+    cm.last_prompt_tokens = 100
+    cm.maybe_compact()
+    assert pruned == [1]  # t1 所在的 1 个用户轮次被摘要
+
+
+def test_prune_callback_failure_does_not_break_compact():
+    def boom(n):
+        raise RuntimeError("账本挂了")
+
+    cm = ContextManager("sys", compact_threshold=1, keep_recent=1,
+                        summarizer=lambda m: "S", on_user_turns_pruned=boom)
+    _seed_two_turns(cm)
+    cm.last_prompt_tokens = 100
+    cm.maybe_compact()  # 不应抛错
+    assert "S" in cm.messages[1]["content"]  # 压缩本身成功

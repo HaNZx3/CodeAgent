@@ -18,6 +18,7 @@ from .stop import StopController
 from .loop import AgentLoop, RunResult
 from .session import SessionStore
 from .memory import load_project_memory
+from .checkpoints import CheckpointStore
 
 # 系统提示词不宜过长，重点是建立稳定的工作流程。
 SYSTEM_PROMPT = """你是一个 Coding Agent，可以在当前 workspace 中通过工具完成编程任务。
@@ -53,6 +54,18 @@ class CodingAgent:
         # 初始会话：每次启动开一个新 session_id。
         # resume 走 switch_session，由 REPL 命令触发。
         self._session_id = self._new_session_id()
+
+        # 代码快照：影子 git 仓库按轮次记录 workspace 状态，供 /back 还原代码。
+        # git 缺失或命令失败时内部自动禁用（enabled=False），不影响对话功能。
+        ckpt_root = (
+            Path(config.checkpoint_root)
+            if config.checkpoint_root
+            else (Path.home() / ".coding-agent" / "checkpoints")
+        )
+        self.checkpoints = CheckpointStore(
+            ckpt_root, config.workspace, self._session_id, enabled=config.checkpoints
+        )
+
         self.context = self._make_context(self._session_id)
         self.stop = StopController(
             config.max_steps, config.max_runtime, config.max_consecutive_errors
@@ -120,7 +133,12 @@ class CodingAgent:
             summarizer=_summarizer,
             store=self.store,
             session_id=session_id,
+            on_user_turns_pruned=self._prune_checkpoints,
         )
+
+    def _prune_checkpoints(self, dropped: int) -> None:
+        """压缩丢弃旧轮次时同步修剪快照账本（维持轮次与快照 1:1）。"""
+        self.checkpoints.prune(dropped)
 
     def switch_session(self, session_id: str) -> None:
         """切换到已有会话：用当前 system prompt 重建 ContextManager，
@@ -129,6 +147,8 @@ class CodingAgent:
         self.context = self._make_context(session_id)
         # loop 内部持有 context 引用，切换后必须同步更新。
         self.loop.context = self.context
+        # 快照账本跟着切到新会话。
+        self.checkpoints.set_session(session_id)
 
     def clear_context(self) -> None:
         """原地清空当前会话上下文：仅保留 system prompt，会话 id 与文件同步清空。
@@ -137,6 +157,8 @@ class CodingAgent:
         （/clear 命令）。system prompt 保持当前 workspace/记忆的最新值。
         """
         self.context.reset()
+        # 快照与对话轮次 1:1，对话清空则账本同步清空（workspace 文件不动）。
+        self.checkpoints.clear_ledger()
 
     def new_session(self, name: str | None = None) -> str:
         """开启新会话：生成新 session_id（或用 name 作为 id），切过去。
@@ -148,6 +170,9 @@ class CodingAgent:
         return sid
 
     def run(self, task: str, on_step=None, on_text=None, on_step_start=None) -> RunResult:
+        # 每轮任务开始前打代码快照（供 /back 还原到「这条消息发出前」）。
+        # 快照内部吞掉一切 git 异常并自动降级，绝不阻塞任务主流程。
+        self.checkpoints.snapshot(task)
         return self.loop.run(
             task, on_step=on_step, on_text=on_text, on_step_start=on_step_start
         )

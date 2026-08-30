@@ -38,6 +38,7 @@ class ContextManager:
         summarizer: Callable[[list[dict]], str] | None = None,
         store=None,
         session_id: str | None = None,
+        on_user_turns_pruned: Callable[[int], None] | None = None,
     ):
         """维护 messages 列表。
 
@@ -47,6 +48,8 @@ class ContextManager:
         - keep_recent:     压缩时保留最近 N 轮（一轮=user+后续 assistant/tool）原文。
         - summarizer:      把旧轮次摘要成字符串的回调；为 None 时优雅退化（不压缩）。
         - store + session_id: 注入后每条消息同步落盘，可跨进程恢复。
+        - on_user_turns_pruned: 压缩丢弃旧用户轮次后回调（参数=丢弃数），
+          供快照账本同步修剪，维持「轮次 <-> 快照」1:1。
         """
         self.max_tool_output = max_tool_output
         self.compact_threshold = compact_threshold
@@ -54,6 +57,7 @@ class ContextManager:
         self._summarizer = summarizer
         self.store = store
         self.session_id = session_id
+        self._on_user_turns_pruned = on_user_turns_pruned
         # 上次调 LLM 的真实 prompt_tokens（由 loop 从 API usage 同步）。
         # None 表示尚未调用过，maybe_compact 跳过——不估算，只用真实数据。
         self.last_prompt_tokens: int | None = None
@@ -133,6 +137,34 @@ class ContextManager:
         prompt = system_prompt if system_prompt is not None else self.messages[0]["content"]
         self.messages = [{"role": "system", "content": prompt}]
 
+    def user_turns(self) -> list[int]:
+        """可回退的用户消息索引（/back 的候选列表）。
+
+        role 过滤天然排除 system 与历史摘要（messages[1]，role=system）：
+        摘要替换掉的轮次已物理删除，无从回退；摘要之后的轮次照常可回退。
+        """
+        return [
+            i for i, m in enumerate(self.messages)
+            if i > 0 and m.get("role") == "user"
+        ]
+
+    def rewind_to(self, index: int) -> int:
+        """回退到 messages[index]（一条用户消息）之前：删除它及其后所有消息。
+
+        返回删除的消息数。落盘文件同步重写；last_prompt_tokens 置空——
+        旧的真实用量属于已回退的历史，不能再用于压缩判断，下次调用后重新取。
+        index 必须来自 user_turns()，否则抛 ValueError（保证回退点是
+        user 轮次边界，不会留下无 tool 结果的孤儿 tool_call）。
+        """
+        if index not in self.user_turns():
+            raise ValueError(f"非法回退点：messages[{index}] 不是可回退的用户消息")
+        removed = len(self.messages) - index
+        self.messages = self.messages[:index]
+        self.last_prompt_tokens = None
+        if self.store is not None and self.session_id is not None:
+            self.store.rewrite(self.session_id, self.messages[1:])
+        return removed
+
     def maybe_compact(self, force: bool = False) -> None:
         """超阈值时把旧轮次压缩成一段 summary system 消息。
 
@@ -176,6 +208,14 @@ class ContextManager:
         # 压缩改写了历史，整文件重写以保持落盘一致。
         if self.store is not None and self.session_id is not None:
             self.store.rewrite(self.session_id, self.messages[1:])
+        # 通知快照账本同步修剪（被摘要的轮次不可再回退）。回调失败只影响
+        # 代码快照对齐，不影响压缩结果本身。
+        dropped = sum(1 for m in old if m.get("role") == "user")
+        if dropped and self._on_user_turns_pruned is not None:
+            try:
+                self._on_user_turns_pruned(dropped)
+            except Exception:
+                pass
 
     def _find_compact_split(self) -> int:
         """返回 messages 上一个安全切分点索引。

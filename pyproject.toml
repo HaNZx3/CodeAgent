@@ -22,3 +22,7 @@ codeagent = "main:main"
 [tool.setuptools]
 py-modules = ["main", "config"]
 packages = ["agent", "llm", "tools"]
+
+[tool.pytest.ini_options]
+# demo/ 是 README 演示项目（故意带 bug 供 agent 修复），不进测试收集
+testpaths = ["tests"]

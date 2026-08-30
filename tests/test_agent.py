@@ -330,7 +330,8 @@ def test_agent_new_session_creates_empty_context(tmp_path):
     from agent.agent import CodingAgent
 
     config = Config(api_key="fake-key", workspace=str(tmp_path),
-                   session_root=str(tmp_path / "sessions"))
+                   session_root=str(tmp_path / "sessions"),
+                   checkpoint_root=str(tmp_path / "ckpt"))
     agent = CodingAgent(config)
     old_sid = agent.session_id
     new_sid = agent.new_session()
@@ -346,7 +347,8 @@ def test_agent_switch_session_loads_history(tmp_path):
     from agent.agent import CodingAgent
 
     config = Config(api_key="fake-key", workspace=str(tmp_path),
-                   session_root=str(tmp_path / "sessions"))
+                   session_root=str(tmp_path / "sessions"),
+                   checkpoint_root=str(tmp_path / "ckpt"))
     agent = CodingAgent(config)
     # 预填一个 session 的历史
     agent.store.append("predefined", {"role": "user", "content": "old task"})
@@ -458,7 +460,8 @@ def test_agent_clear_context_keeps_session_id(tmp_path):
     from agent.agent import CodingAgent
 
     config = Config(api_key="fake-key", workspace=str(tmp_path),
-                   session_root=str(tmp_path / "sessions"))
+                   session_root=str(tmp_path / "sessions"),
+                   checkpoint_root=str(tmp_path / "ckpt"))
     agent = CodingAgent(config)
     agent.store.append(agent.session_id, {"role": "user", "content": "old"})
     agent.context.add_assistant(ModelResponse(text="a"))
@@ -481,3 +484,31 @@ def test_usage_absent_llm_yields_zero_usage():
     assert result.succeeded
     assert result.usage["calls"] == 0
     assert result.usage["prompt_tokens"] == 0
+
+
+# ── Phase 4：代码快照与对话回退的 Agent 装配 ──────────────────────────────
+
+
+def test_agent_checkpoint_wiring(tmp_path):
+    """CodingAgent 装配 CheckpointStore：/clear 清账本、切换会话切账本。"""
+    from config import Config
+    from agent.agent import CodingAgent
+
+    config = Config(api_key="fake-key", workspace=str(tmp_path),
+                   session_root=str(tmp_path / "sessions"),
+                   checkpoint_root=str(tmp_path / "ckpt"))
+    agent = CodingAgent(config)
+    assert agent.checkpoints.enabled
+    assert agent.checkpoints.session_id == agent.session_id
+
+    # /clear：对话清空，账本同步清空（workspace 文件不动）
+    agent.context.add_user("t1")
+    agent.checkpoints._ledger.append(
+        {"turn": 0, "commit": "abc", "ts": 1.0, "preview": "t1"})
+    agent.clear_context()
+    assert agent.checkpoints.entries() == []
+
+    # /new、/resume 走 switch_session：账本切到新会话
+    agent.switch_session("other")
+    assert agent.checkpoints.session_id == "other"
+    assert agent.checkpoints.entries() == []

@@ -53,6 +53,10 @@ class Config:
     # 会话持久化（Phase 2）
     session_root: str = ""           # 空=~/.coding-agent/sessions
 
+    # 代码快照与对话回退（Phase 4）
+    checkpoints: bool = True         # 影子 git 快照，供 /back 回退代码；git 缺失时自动禁用
+    checkpoint_root: str = ""        # 空=~/.coding-agent/checkpoints
+
     @classmethod
     def from_env(cls) -> "Config":
         """从环境变量（或 .env 文件）构建配置。
@@ -87,6 +91,9 @@ class Config:
             keep_recent=int(os.environ.get("CODING_AGENT_KEEP_RECENT", "6")),
             context_window=int(os.environ.get("CODING_AGENT_CONTEXT_WINDOW", "128000")),
             session_root=os.environ.get("CODING_AGENT_SESSION_ROOT", ""),
+            checkpoint_root=os.environ.get("CODING_AGENT_CHECKPOINT_ROOT", ""),
+            checkpoints=os.environ.get("CODING_AGENT_CHECKPOINTS", "1")
+            .strip().lower() not in ("0", "false", "no", "off"),
         )
 
     def ensure_api_key(self) -> None:

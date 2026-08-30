@@ -1,29 +1,37 @@
-"""命令层测试：验证 /delete 各分支与 token 显示辅助函数，不依赖真实 LLM 与交互。
+"""命令层测试：验证 /delete、/back 各分支与 token 显示辅助函数，不依赖真实 LLM。
 
-用最小 _FakeAgent stub 暴露 _handle_command 用到的 store/session_id/new_session，
-配合真实 SessionStore(tmp_path) 与 monkeypatch 的 input 覆盖：
-  无参数 / 不存在 / 删其它会话 / 删当前会话 / all 确认 / all 取消 / all 无会话
+用最小 _FakeAgent stub 暴露 _handle_command 用到的接口：真实 SessionStore(tmp_path)、
+真实 ContextManager（验证 /back 真正截断并落盘）与禁用的 CheckpointStore
+（/back 走「仅回退对话」分支），配合 monkeypatch 的 input 覆盖交互分支。
 另覆盖 Claude Code 式用量显示的纯函数：_fmt_tokens / _context_bar。
 """
 
 import uuid
 
+from llm.client import ModelResponse
 from config import Config
 from main import _handle_command, _fmt_tokens, _context_bar
 from agent.session import SessionStore
+from agent.context import ContextManager
+from agent.checkpoints import CheckpointStore
 
 
 class _FakeAgent:
-    """最小 agent stub：暴露 _handle_command 在 /delete 分支用到的接口。
+    """最小 agent stub：暴露 _handle_command 用到的接口。
 
     真实 CodingAgent 的 new_session 会重建 ContextManager，这里只模拟
-    「生成新 id 并切换 session_id」的对外可观察行为，足以验证命令逻辑。
+    「生成新 id 并切换 session_id」的对外可观察行为；context 与 checkpoints
+    用真实对象（禁用快照），足以验证命令逻辑与落盘效果。
     """
 
     def __init__(self, store, sid):
         self.store = store
         self.session_id = sid
         self.cleared = False
+        self.context = ContextManager("sys", store=store, session_id=sid)
+        self.checkpoints = CheckpointStore(
+            store.root / "ckpt", store.workspace, sid, enabled=False
+        )
 
     def new_session(self, name=None):
         new = name or uuid.uuid4().hex[:12]
@@ -32,6 +40,7 @@ class _FakeAgent:
 
     def clear_context(self):
         self.cleared = True
+        self.context.reset()
 
 
 def _make(store, sid="current1"):
@@ -123,6 +132,108 @@ def test_clear_resets_context_in_place(capsys, tmp_path):
     assert "已清空当前会话上下文" in out
     assert agent.cleared is True
     assert agent.session_id == "current1"  # id 不变（区别于 /new）
+
+
+# ── /back：对话回退 ───────────────────────────────────────────────────────
+
+
+def _seed_turns(agent, n=2):
+    for i in range(1, n + 1):
+        agent.context.add_user(f"任务{i}")
+        agent.context.add_assistant(ModelResponse(text=f"回答{i}"))
+
+
+def test_back_without_turns_prints_hint(capsys, tmp_path):
+    store = SessionStore(tmp_path, "/ws")
+    agent, config = _make(store)
+    assert _handle_command(agent, "/back", config) is True
+    assert "没有可回退" in capsys.readouterr().out
+
+
+def test_back_lists_turns_and_rewinds_on_choice(monkeypatch, capsys, tmp_path):
+    store = SessionStore(tmp_path, "/ws")
+    agent, config = _make(store)
+    _seed_turns(agent)
+    monkeypatch.setattr("builtins.input", lambda *a, **k: "1")
+
+    _handle_command(agent, "/back", config)
+
+    out = capsys.readouterr().out
+    assert "回退到哪条消息之前" in out
+    assert "任务1" in out and "任务2" in out
+    # 回退到第 1 条之前：只剩 system，文件同步清空
+    assert len(agent.context.messages) == 1
+    assert store.load(agent.session_id) == []
+    assert "已回退" in out
+
+
+def test_back_rewind_to_second_turn_keeps_first(monkeypatch, capsys, tmp_path):
+    store = SessionStore(tmp_path, "/ws")
+    agent, config = _make(store)
+    _seed_turns(agent)
+    monkeypatch.setattr("builtins.input", lambda *a, **k: "2")
+
+    _handle_command(agent, "/back", config)
+
+    # 回退到第 2 条之前：保留第一轮
+    assert [m.get("content") for m in agent.context.messages[1:]] == ["任务1", "回答1"]
+    assert [m.get("content") for m in store.load(agent.session_id)] == ["任务1", "回答1"]
+
+
+def test_back_cancel_on_empty_input(monkeypatch, capsys, tmp_path):
+    store = SessionStore(tmp_path, "/ws")
+    agent, config = _make(store)
+    _seed_turns(agent)
+    monkeypatch.setattr("builtins.input", lambda *a, **k: "")
+
+    _handle_command(agent, "/back", config)
+
+    assert "已取消" in capsys.readouterr().out
+    assert len(agent.context.messages) == 5  # 未变
+
+
+def test_back_cancel_on_invalid_number(monkeypatch, capsys, tmp_path):
+    store = SessionStore(tmp_path, "/ws")
+    agent, config = _make(store)
+    _seed_turns(agent)
+    monkeypatch.setattr("builtins.input", lambda *a, **k: "9")
+
+    _handle_command(agent, "/back", config)
+
+    assert "已取消" in capsys.readouterr().out
+    assert len(agent.context.messages) == 5  # 未变
+
+
+def test_back_direct_number_arg_skips_prompt(monkeypatch, capsys, tmp_path):
+    """/back <n> 直接回退，不询问编号（input 被调用即失败）。"""
+    store = SessionStore(tmp_path, "/ws")
+    agent, config = _make(store)
+    _seed_turns(agent)
+
+    def _must_not_ask(*a, **k):
+        raise AssertionError("/back <n> 不应询问编号")
+
+    monkeypatch.setattr("builtins.input", _must_not_ask)
+    _handle_command(agent, "/back 2", config)
+
+    # 回退到第 2 条之前：保留第一轮
+    assert [m.get("content") for m in agent.context.messages[1:]] == ["任务1", "回答1"]
+    assert "已回退" in capsys.readouterr().out
+
+
+def test_back_skips_code_restore_when_ledger_misaligned(capsys, tmp_path):
+    """账本与轮次不对齐（如旧会话无快照）时仅回退对话，并给出提示。"""
+    store = SessionStore(tmp_path, "/ws")
+    agent, config = _make(store)
+    _seed_turns(agent)
+    # enabled=True 但账本为空 -> 与 2 个轮次不对齐
+    agent.checkpoints.enabled = True
+
+    _handle_command(agent, "/back 1", config)
+
+    out = capsys.readouterr().out
+    assert "不对齐" in out
+    assert len(agent.context.messages) == 1  # 对话仍被回退
 
 
 # ── Claude Code 式用量显示辅助函数 ────────────────────────────────────────

@@ -215,6 +215,7 @@ COMMANDS: dict[str, str] = {
     "/resume": "恢复历史会话 /resume <id>",
     "/sessions": "列出当前 workspace 的所有会话",
     "/delete": "删除会话：/delete <id> 或 /delete all",
+    "/back": "回退对话（及代码）到某条用户消息之前 /back [n]",
     "/compact": "手动压缩当前对话历史",
     "/model": "显示当前模型",
     "/workspace": "显示当前工作目录",
@@ -323,6 +324,114 @@ def _readline(prompt: str) -> str:
             _refresh()
 
 
+def _handle_back(agent: CodingAgent, arg: str) -> None:
+    """/back：回退对话（及代码）到某条用户消息之前。
+
+    代码还原先于对话截断：还原可能因 git 异常失败，失败时整个回退取消，
+    保证「对话与代码要么都回退，要么都不动」。
+    还原默认走精确回退（只反向 apply 本会话的改动，保留其它会话的修改）；
+    与其它会话同文件交叉时降级询问是否全量回退。
+    快照不可用（未启用 / 账本与轮次不对齐）时退化为仅回退对话。
+    """
+    turns = agent.context.user_turns()
+    if not turns:
+        print(f"{C.GRAY}（没有可回退的用户消息）{C.RESET}")
+        return
+    msgs = agent.context.get_messages()
+    ck = getattr(agent, "checkpoints", None)
+    # 账本第 k 项 = 第 k 条用户消息发出前的快照；条数对齐才可还原代码。
+    use_ckpt = (
+        ck is not None
+        and ck.enabled
+        and len(ck.entries()) == len(turns)
+    )
+    if ck is not None and ck.enabled and not use_ckpt:
+        print(f"{C.GRAY}（快照账本与对话轮次不对齐，仅回退对话）{C.RESET}")
+
+    # ── 选择回退点 ──
+    n: int | None = None
+    if arg.isdigit() and 1 <= int(arg) <= len(turns):
+        n = int(arg)  # /back <n> 直接回退，不再询问
+    else:
+        print(f"{C.CYAN}回退到哪条消息之前？{C.RESET}")
+        for i, idx in enumerate(turns, 1):
+            preview = _shorten((msgs[idx].get("content") or "").splitlines()[0], 46)
+            mark = ""
+            if use_ckpt:
+                mark = f"  {C.GRAY}[快照 {ck.entries()[i - 1]['commit'][:7]}]{C.RESET}"
+            print(f"  {C.BOLD}{i}{C.RESET}  {preview}{mark}")
+        try:
+            choice = input(f"{C.GRAY}输入编号（回车取消）{C.RESET} ").strip()
+        except EOFError:
+            return
+        if choice.isdigit() and 1 <= int(choice) <= len(turns):
+            n = int(choice)
+        else:
+            print(f"{C.GRAY}已取消{C.RESET}")
+            return
+    idx = turns[n - 1]
+
+    # ── 代码还原（先于对话截断）──
+    if use_ckpt:
+        entry = ck.entries()[n - 1]
+        plan = ck.plan_restore(entry)
+        if plan is not None:
+            own_files = ck.precise_files(entry)
+            if plan.conflicts:
+                print(f"{C.YELLOW}⚠ 以下会话在该快照之后也修改过 workspace：{C.RESET}")
+                for sid, files in plan.conflicts:
+                    print(f"    会话 {sid}：{_shorten(', '.join(files), 80)}")
+                print(f"{C.GRAY}  精确回退只撤销本会话的改动，其它会话的修改会保留。{C.RESET}")
+            if own_files:
+                print(f"{C.GRAY}将撤销本会话对以下文件的改动：{C.RESET}")
+                print(f"    {_shorten(', '.join(own_files), 80)}")
+            else:
+                print(f"{C.GRAY}本会话在该快照之后没有代码改动{C.RESET}")
+            try:
+                ok = input(f"{C.YELLOW}确认回退对话+代码？[y/N]{C.RESET} ").strip().lower()
+            except EOFError:
+                ok = ""
+            if ok != "y":
+                print(f"{C.GRAY}已取消{C.RESET}")
+                return
+            pr = ck.restore_precise(entry)
+            if pr is not None and pr.ok:
+                if pr.files:
+                    print(f"{C.GREEN}✓ 已精确回退本会话对 {len(pr.files)} 个文件的改动{C.RESET}")
+                else:
+                    print(f"{C.GREEN}✓ 代码无需改动{C.RESET}")
+                print(f"{C.GRAY}还原前状态已存为安全快照 {pr.safety[:7]}，"
+                      f"如需找回见 README「快照与回退」{C.RESET}")
+            else:
+                if pr is None:
+                    print(f"{C.RED}✗ 代码还原失败，回退已取消（对话与代码保持原样）{C.RESET}")
+                    return
+                # 同文件交叉，反向 apply 失败：工作区已回滚，询问是否全量回退
+                print(f"{C.YELLOW}✗ 其它会话与你在相同文件上有交叉改动，无法精确回退：{C.RESET}")
+                print(f"    {_shorten(', '.join(pr.files), 80)}")
+                print(f"{C.GRAY}工作区已回滚到还原前状态（安全快照 {pr.safety[:7]}）{C.RESET}")
+                try:
+                    hard = input(f"{C.YELLOW}改用全量回退？将一并撤销其它会话的改动 [y/N]{C.RESET} ").strip().lower()
+                except EOFError:
+                    hard = ""
+                if hard != "y":
+                    print(f"{C.GRAY}已取消{C.RESET}")
+                    return
+                result = ck.restore(entry)
+                if result is None:
+                    print(f"{C.RED}✗ 全量回退失败，对话与代码保持原样{C.RESET}")
+                    return
+                print(f"{C.GREEN}✓ 代码已全量还原至快照 {result.target[:7]}{C.RESET}")
+                print(f"{C.GRAY}还原前状态已存为安全快照 {result.safety[:7]}，"
+                      f"如需找回见 README「快照与回退」{C.RESET}")
+        # 无论是否走了代码还原，账本都必须与回退后的轮次保持 1:1。
+        ck.truncate(n - 1)
+
+    # ── 对话截断 ──
+    removed = agent.context.rewind_to(idx)
+    print(f"{C.GREEN}✓ 已回退：删除其后 {removed} 条消息{C.RESET}")
+
+
 def _handle_command(agent: CodingAgent, cmd: str, config: Config) -> bool:
     """处理斜杠内置命令。返回 True 表示已处理（不应发给 Agent）。
 
@@ -407,6 +516,9 @@ def _handle_command(agent: CodingAgent, cmd: str, config: Config) -> bool:
                 print(f"{C.GRAY}已取消{C.RESET}")
                 return True
             n = agent.store.clear_all()
+            ck = getattr(agent, "checkpoints", None)
+            if ck is not None:
+                ck.drop_all()  # 快照账本随会话一并清理
             # 当前会话必被删，开新空会话避免内存 messages 与文件不一致。
             new_id = agent.new_session()
             print(f"{C.GREEN}✓ 已删除 {n} 个会话{C.RESET}")
@@ -415,6 +527,9 @@ def _handle_command(agent: CodingAgent, cmd: str, config: Config) -> bool:
         target = arg
         if target == agent.session_id:
             agent.store.clear(target)
+            ck = getattr(agent, "checkpoints", None)
+            if ck is not None:
+                ck.drop_session(target)
             new_id = agent.new_session()
             print(f"{C.GREEN}✓ 已删除当前会话，已开新会话：{new_id}{C.RESET}")
             return True
@@ -423,7 +538,13 @@ def _handle_command(agent: CodingAgent, cmd: str, config: Config) -> bool:
             print(f"{C.GRAY}用 /sessions 查看可用会话{C.RESET}")
             return True
         agent.store.clear(target)
+        ck = getattr(agent, "checkpoints", None)
+        if ck is not None:
+            ck.drop_session(target)
         print(f"{C.GREEN}✓ 已删除会话：{target}{C.RESET}")
+        return True
+    if name == "/back":
+        _handle_back(agent, arg)
         return True
     if name == "/compact":
         before = len(agent.context.get_messages())
@@ -458,6 +579,12 @@ def _handle_command(agent: CodingAgent, cmd: str, config: Config) -> bool:
         else:
             print(f"  {C.GRAY}上下文{C.RESET}      尚未调用 LLM（窗口 {window:,} tokens）")
         print(f"  {C.GRAY}当前会话{C.RESET}    {agent.session_id}")
+        ck = getattr(agent, "checkpoints", None)
+        if ck is not None:
+            if ck.enabled:
+                print(f"  {C.GRAY}代码快照{C.RESET}    {len(ck.entries())} 个（/back 可回退代码）")
+            else:
+                print(f"  {C.GRAY}代码快照{C.RESET}    不可用（git 缺失或已关闭）")
         print(f"  {C.GRAY}workspace{C.RESET}   {config.workspace}")
         return True
     print(f"{C.RED}✗ 未知命令：{name}{C.RESET}  输入 {C.BOLD}/help{C.RESET} 查看可用命令")

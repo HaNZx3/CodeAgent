@@ -16,6 +16,9 @@
   保留最近 N 轮原文；按 user 轮次切分，保证 tool_call/tool 消息配对完整
 - 会话持久化与隔离：每条消息同步落盘 JSONL，按 workspace 哈希分目录，
   进程退出后可 /resume 恢复；原子重写（.tmp + os.replace）防崩溃损坏
+- 对话回退 + 代码快照（/back）：影子 git 仓库按轮次记录 workspace 状态，
+  回退对话时精确撤销本会话的代码改动（其它会话的交叉修改原样保留）；
+  还原前自动安全快照，还原本身永远可撤销
 - 项目记忆：workspace/AGENT.md 与 ~/.coding-agent/USER.md 自动注入 system prompt
 - Claude Code 式用量显示：全部取自 API 返回的 usage 字段，无任何估算
 - 流式打字机输出、工具执行 spinner、斜杠命令 ghost text 实时补全
@@ -58,6 +61,9 @@
 /sessions        列出当前 workspace 的所有会话
 /delete <id>     删除指定会话；/delete all 删除全部（需确认，删当前会话后自动开新）
 /clear           清空当前会话上下文（仅保留系统提示词，会话 id 不变）
+/back [n]        回退到第 n 条用户消息之前（无参数时列候选菜单）；
+                 精确回退本会话的代码改动（同文件交叉时询问是否全量回退），
+                 需 y/N 确认
 /compact         手动压缩当前对话历史
 /status          上下文占用（真实 tokens / 窗口 + 进度条）、距压缩余量、当前会话
 /model           显示当前模型
@@ -83,13 +89,15 @@ CODING_AGENT_COMPACT_THRESHOLD  自动压缩阈值（默认 80000，按真实 pr
 CODING_AGENT_KEEP_RECENT        压缩时保留最近轮数（默认 6）
 CODING_AGENT_CONTEXT_WINDOW     上下文窗口大小，仅用于占用显示（默认 128000）
 CODING_AGENT_SESSION_ROOT       会话文件根目录（默认 ~/.coding-agent/sessions）
+CODING_AGENT_CHECKPOINTS        代码快照开关（默认 1 开启；git 缺失时自动降级）
+CODING_AGENT_CHECKPOINT_ROOT    快照根目录（默认 ~/.coding-agent/checkpoints）
 
 ## 目录结构
-agent/   Agent 状态与循环（loop / context / stop / session / memory）
+agent/   Agent 状态与循环（loop / context / stop / session / memory / checkpoints）
 llm/     模型 API 通信与响应标准化
 tools/   工具定义与本地执行（file / search / shell / workspace 边界）
 demo/    演示用小型 Python 项目（含故意植入的 bug）
-tests/   自动化测试（82 个：tool / context / agent loop / session / memory / 命令层）
+tests/   自动化测试（tool / context / agent loop / session / memory / checkpoint / 命令层）
 
 ## 运行测试
 pytest tests/
@@ -99,6 +107,29 @@ demo/calculator.py 的 multiply 函数有一个 bug（+ 应为 *）。
 让 Agent 执行「修复 demo 项目中的 bug 并让所有测试通过」，它会自动：
 list_files -> search_code -> read_file -> edit_file -> run_command(pytest)
 -> 根据失败继续修复 -> 通过 -> 总结。
+
+## 快照与回退（/back）
+每轮任务开始前，Agent 把 workspace 全量状态 commit 到一个影子 git 仓库
+（~/.coding-agent/checkpoints/<workspace-slug>/，通过 --git-dir/--work-tree
+指向你的目录，绝不触碰你自己的 .git）。快照与对话轮次一一对应：
+第 k 个快照 = 第 k 条用户消息发出前的代码状态（账本持久化，跨进程可回退）。
+
+/back 列出历史消息，选中某条后：对话截断到该消息之前，代码精确回退本会话
+在该快照之后的改动——影子仓库中每个快照 commit 相对其父提交的 diff 恰好
+就是该会话当时做的改动，把这些 commit 逆序反向 apply 即只撤销自己的修改，
+其它会话的交叉修改原样保留；仅当与其它会话改了同一文件时才询问是否降级
+为全量回退（git reset --hard，会正确删除快照后新增的文件）。
+
+安全设计：
+- .env* 等凭据文件被内置 exclude 永久排除，不进任何快照、还原也不触碰
+- 还原前自动打「安全快照」——任何还原本身都可撤销，误回退零丢失；
+  安全快照 hash 会打印出来，找回方式（手动执行）：
+  git --git-dir ~/.coding-agent/checkpoints/<slug>/.git \
+      --work-tree <workspace> reset --hard <safety_hash>
+- 同一 workspace 多会话交叉修改时，回退前列出其它会话在目标快照之后
+  改过的文件：精确回退保留这些改动（同文件交叉除外），全量回退才覆盖
+- git 缺失或命令失败：快照自动降级，/back 仅回退对话，不影响正常使用
+- 被压缩摘要掉的轮次无法回退（Claude Code 同样如此）
 
 ## 项目记忆（可选）
 在 workspace 根目录放 AGENT.md，写入项目特定指引（构建命令、测试方式、
