@@ -16,6 +16,9 @@
   保留最近 N 轮原文；按 user 轮次切分，保证 tool_call/tool 消息配对完整
 - 会话持久化与隔离：每条消息同步落盘 JSONL，按 workspace 哈希分目录，
   进程退出后可 /resume 恢复；原子重写（.tmp + os.replace）防崩溃损坏
+- 高危操作确认：删除/覆写类操作执行前弹 y/N 确认（rm/del/rmdir/Remove-Item、
+  > 覆写已有文件、write_file 覆盖非空文件、edit_file 替换为空）；
+  rm -rf /、format、mkfs、dd 等灾难级命令直接硬拒
 - 对话回退 + 代码快照（/back）：影子 git 仓库按轮次记录 workspace 状态，
   回退对话时精确撤销本会话的代码改动（其它会话的交叉修改原样保留）；
   还原前自动安全快照，还原本身永远可撤销
@@ -24,6 +27,8 @@
 - Claude Code 式输入体验：输入 / 弹出命令菜单（前缀过滤、精确匹配置顶、
   ↑/↓ 选择、Tab/Enter 补全），输入栏右下角常驻真实用量；流式打字机输出、
   工具执行 spinner
+- 运行中可中断：Agent 思考/执行期间按 Ctrl+C 即时打断阻塞的 LLM 调用，
+  返回输入栏重新提问
 
 ## 快速开始
 1. 安装（可编辑安装会同时装好依赖，并注册 codeagent 全局命令）：

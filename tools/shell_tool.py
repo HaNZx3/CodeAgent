@@ -2,9 +2,11 @@
 
 这是最需要限制的工具。第一版不追求操作系统级沙箱，但必须画出明确的安全边界：
     1. cwd 固定为 workspace
-    2. 命令黑名单拦截明显危险命令
-    3. 设置执行超时
-    4. 限制 stdout/stderr 输出大小
+    2. 灾难级命令（rm -rf /、format、mkfs、dd、关机重启…）硬拒绝
+    3. 破坏性但可经 /back 找回的命令（rm / del / rmdir / Remove-Item、
+       > 覆写已存在文件）执行前须经用户确认
+    4. 设置执行超时
+    5. 限制 stdout/stderr 输出大小
 """
 
 from __future__ import annotations
@@ -12,25 +14,36 @@ from __future__ import annotations
 import re
 import subprocess
 
-from .base import Tool, ToolResult
-from .workspace import Workspace
+from .base import RiskInfo, Tool, ToolResult
+from .workspace import Workspace, WorkspaceError
 
 MAX_OUTPUT = 8000  # 每个流最多保留的字符数
 
-# 危险命令黑名单（正则，忽略大小写）。这是「明确的安全边界」，而非完整沙箱。
-DANGEROUS_PATTERNS = [
-    r"\brm\s+-rf\b",                 # rm -rf ...
-    r"\brm\s+-r\s+-f\b",             # rm -r -f ...
-    r"\bdel\s+/[fsq]\b",             # Windows del /s /f /q
+# 灾难级命令（不可逆 / 系统级）：直接拒绝，不询问。
+# rm -rf 仅在目标为根/家目录/通配时才算灾难；workspace 内的 rm -rf subdir
+# 属破坏性但可回退，走确认。
+_HARD_BLOCK_PATTERNS = [
+    r"\brm\s+(-\w*r\w*f\w*|-\w*f\w*r\w*|-r\s+-f|-f\s+-r)\s+(/(\s|$|\*)|~(\s|$)|\*(\s|$)|\$HOME)",
     r"\bshutdown\b",
     r"\breboot\b",
-    r"\bformat\s+[a-z]:",            # format C:
+    r"\bformat\s+[a-z]:",
     r"\bmkfs\b",
     r"\bdd\s+if=",                   # dd 覆写磁盘
     r">\s*/dev/sd",                  # 重定向覆盖块设备
     r"\bchmod\s+-R\s+777\s+/",
     r":\(\)\s*\{.*\}\s*;",           # fork bomb（简化检测）
 ]
+
+# 破坏性但可经 /back 找回：执行前确认（列出命令本身）。
+_CONFIRM_PATTERNS = [
+    r"\brm\b",                       # rm（含 rm -rf subdir，已排除灾难级）
+    r"\bdel\b",                      # Windows del
+    r"\brmdir\b",
+    r"\bRemove-Item\b",
+    r"\brd\s+/s\b",
+]
+
+_REDIRECT_RE = re.compile(r">+\s*([^\s|;&]+)")
 
 
 class ShellTool(Tool):
@@ -48,12 +61,37 @@ class ShellTool(Tool):
         self.workspace = workspace
         self.timeout = timeout
 
+    def risk(self, arguments: dict) -> RiskInfo | None:
+        """删除/覆写类命令：先排除灾难级（交回 execute 硬拒），再确认。
+
+        灾难级命中时返回 None——不重复询问，让 execute 给出「被拦截」。
+        其余破坏性命令返回 RiskInfo（detail=完整命令），由 registry 弹窗。
+        > 重定向仅在目标为 workspace 内已存在文件时才确认（创建新文件不算）。
+        """
+        command = arguments.get("command", "")
+        if not command:
+            return None
+        if self._hard_block_reason(command):
+            return None  # 灾难级，交回 execute 硬拒
+        for pattern in _CONFIRM_PATTERNS:
+            if re.search(pattern, command, flags=re.IGNORECASE):
+                return RiskInfo(
+                    action="执行删除类命令", detail=command, files=[],
+                )
+        # > 重定向覆写已存在文件：精确到文件级确认，避免 echo > 新文件也被打扰
+        existing = self._redirect_existing_targets(command)
+        if existing:
+            return RiskInfo(
+                action="命令重定向覆写已有文件", detail=command, files=existing,
+            )
+        return None
+
     def execute(self, arguments: dict) -> ToolResult:
         command = arguments.get("command", "")
         if not command.strip():
             return ToolResult.fail("command 不能为空")
 
-        blocked = self._blocked_reason(command)
+        blocked = self._hard_block_reason(command)
         if blocked:
             return ToolResult.fail(f"危险命令被拦截（匹配规则: {blocked}）")
 
@@ -91,11 +129,31 @@ class ShellTool(Tool):
             )
         return ToolResult.ok(output)
 
-    def _blocked_reason(self, command: str) -> str | None:
-        for pattern in DANGEROUS_PATTERNS:
+    def _hard_block_reason(self, command: str) -> str | None:
+        for pattern in _HARD_BLOCK_PATTERNS:
             if re.search(pattern, command, flags=re.IGNORECASE):
                 return pattern
         return None
+
+    def _redirect_existing_targets(self, command: str) -> list[str]:
+        """提取 > / 2> / &> 重定向目标中、workspace 内已存在的文件路径。
+
+        >>（追加）不算覆写，跳过。只确认「会清空已有文件」的重定向。
+        """
+        targets: list[str] = []
+        for m in _REDIRECT_RE.finditer(command):
+            if m.group(0).startswith(">>"):  # 追加，非破坏性
+                continue
+            tok = m.group(1).strip('"\'')
+            if not tok:
+                continue
+            try:
+                p = self.workspace.resolve(tok)
+            except WorkspaceError:
+                continue
+            if p.is_file():
+                targets.append(tok)
+        return targets
 
     @staticmethod
     def _trim(text: str) -> str:

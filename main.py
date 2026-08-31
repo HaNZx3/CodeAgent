@@ -19,6 +19,7 @@ from pathlib import Path
 from config import Config
 from agent.agent import CodingAgent
 from agent.loop import RunResult, StepRecord
+from tools.base import RiskInfo
 
 
 # ── ANSI 颜色 ──────────────────────────────────────────────────────────────
@@ -158,20 +159,19 @@ class _TurnView:
             self._dirty = False
 
     def finish(self, result: RunResult) -> None:
-        """收尾：最终回答已流式展示，这里只补一行收尾标记（含真实用量）。"""
+        """收尾：最终回答已流式展示，这里只补一行收尾标记（含本轮用量）。
+
+        上下文规模不再在此重复——它已由输入栏右下角常驻显示，收尾行只报
+        本轮消耗，避免与状态栏信息冗余。
+        """
         self._spinner.stop()
         self._newline()
         print()
-        # 真实用量并入状态行：prompt 取本次最后一次调用的值——最终回答后
-        # messages 不再变化，它就是当前上下文的真实规模。
         u = result.usage
         usage_part = ""
         if u.get("calls"):
-            used = u["prompt_tokens"]
-            pct = used / self._context_window * 100 if self._context_window > 0 else 100.0
             usage_part = (
-                f" · 上下文 {_fmt_tokens(used)}/{_fmt_tokens(self._context_window)}"
-                f" ({pct:.1f}%) · 本轮 {u['calls']} 次调用 {_fmt_tokens(u['total_tokens'])} tokens"
+                f" · 本轮 {u['calls']} 次调用 {_fmt_tokens(u['total_tokens'])} tokens"
             )
         if result.final_text is not None:
             print(f"{C.GREEN}{'─' * 40}{C.RESET}")
@@ -184,6 +184,26 @@ def _shorten(text: str, limit: int = 120) -> str:
     if len(text) <= limit:
         return text
     return text[:limit] + "..."
+
+
+def _confirm_destructive(risk: RiskInfo, view: _TurnView | None) -> bool:
+    """高危操作执行前确认（对齐 Claude Code）。
+
+    暂停当前 spinner，打印动作 / 命令 / 受影响文件，y/N 确认。
+    提示代码快照可用 /back 找回。非交互场景（view 为 None）直接放行。
+    """
+    if view is not None:
+        view._spinner.stop()
+        view._newline()
+    print(f"{C.YELLOW}⚠ 即将{risk.action}：{C.RESET}{C.BOLD}{risk.detail}{C.RESET}")
+    if risk.files:
+        print(f"{C.GRAY}  受影响文件：{_shorten(', '.join(risk.files), 80)}{C.RESET}")
+    print(f"{C.GRAY}  已开启代码快照，误操作可用 /back 找回{C.RESET}")
+    try:
+        ok = input(f"{C.YELLOW}确认执行？[y/N]{C.RESET} ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        ok = ""
+    return ok == "y"
 
 
 def _fmt_tokens(n: int) -> str:
@@ -733,19 +753,28 @@ def main(argv: list[str] | None = None) -> int:
 def _run_once(agent: CodingAgent, task: str) -> None:
     print(f"{C.CYAN}❯ {C.RESET}{task}\n")
     view = _TurnView(agent.config.context_window)
+    # 一次性模式同样接入高危确认（同 REPL）。
+    current: list[_TurnView | None] = [view]
+    agent.registry.confirm_callback = lambda risk: _confirm_destructive(risk, current[0])
     view.begin()
-    view.finish(
-        agent.run(
+    try:
+        result = agent.run(
             task,
             on_step=view.step,
             on_text=view.text,
             on_step_start=view.step_start,
         )
-    )
+    except KeyboardInterrupt:
+        # Ctrl+C：打断当前思考 / 工具执行，返回（一次性模式即结束）。
+        view._spinner.stop()
+        view._newline()
+        print(f"\n{C.YELLOW}⏹ 已中断（Ctrl+C）{C.RESET}")
+        return
+    view.finish(result)
 
 
 def _run_repl(agent: CodingAgent, config: Config) -> None:
-    print(f"{C.GRAY}输入任务开始，/help 查看命令，/exit 退出{C.RESET}\n")
+    print(f"{C.GRAY}输入任务开始，/help 查看命令，/exit 退出；运行中按 Ctrl+C 中断{C.RESET}\n")
     # 输入栏右下角常驻状态的数据：全部取自 API 返回的真实 usage。
     # ctx = 最近一次调用的 prompt_tokens（即当前上下文规模），
     # total = 本会话累计消耗 tokens。
@@ -758,6 +787,11 @@ def _run_repl(agent: CodingAgent, config: Config) -> None:
         pct = usage["ctx"] / win * 100 if win > 0 else 0.0
         return (f"⏵ {_fmt_tokens(usage['ctx'])}/{_fmt_tokens(win)}"
                 f" · {pct:.1f}% · 累计 {_fmt_tokens(usage['total'])} tokens")
+
+    # 高危确认：registry 在 execute 前调用。需要暂停当前轮的 spinner 再 input，
+    # 因此用 holder 持有「当前 _TurnView」，每轮 run 前更新。
+    current: list[_TurnView | None] = [None]
+    agent.registry.confirm_callback = lambda risk: _confirm_destructive(risk, current[0])
 
     while True:
         try:
@@ -775,13 +809,24 @@ def _run_repl(agent: CodingAgent, config: Config) -> None:
             break
         print()
         view = _TurnView(config.context_window)
+        current[0] = view
         view.begin()
-        result = agent.run(
-            task,
-            on_step=view.step,
-            on_text=view.text,
-            on_step_start=view.step_start,
-        )
+        try:
+            result = agent.run(
+                task,
+                on_step=view.step,
+                on_text=view.text,
+                on_step_start=view.step_start,
+            )
+        except KeyboardInterrupt:
+            # Ctrl+C：打断当前思考 / 工具执行，停 spinner 后回到输入栏。
+            view._spinner.stop()
+            view._newline()
+            print(f"\n{C.YELLOW}⏹ 已中断（Ctrl+C）{C.RESET}")
+            current[0] = None
+            print()
+            continue
+        current[0] = None
         view.finish(result)
         u = result.usage
         if u.get("calls"):

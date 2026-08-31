@@ -8,7 +8,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from .base import Tool, ToolResult
+from .base import RiskInfo, Tool, ToolResult
 from .workspace import Workspace, WorkspaceError
 
 # list_files / search 需要忽略的目录
@@ -128,6 +128,21 @@ class WriteFileTool(Tool):
     def __init__(self, workspace: Workspace):
         self.workspace = workspace
 
+    def risk(self, arguments: dict) -> RiskInfo | None:
+        """覆盖已有非空文件属破坏性操作：清空前确认。
+
+        目标不存在或为空文件时不确认（创建新文件 / 改空文件无损失）。
+        路径越界时交回 execute 报错，不在此处理。
+        """
+        raw = arguments.get("path", "")
+        try:
+            p = self.workspace.resolve(raw)
+        except WorkspaceError:
+            return None
+        if p.is_file() and p.stat().st_size > 0:
+            return RiskInfo(action="覆盖已有文件", detail=raw, files=[raw])
+        return None
+
     def execute(self, arguments: dict) -> ToolResult:
         raw = arguments.get("path", "")
         try:
@@ -163,6 +178,16 @@ class EditFileTool(Tool):
 
     def __init__(self, workspace: Workspace):
         self.workspace = workspace
+
+    def risk(self, arguments: dict) -> RiskInfo | None:
+        """new_text 为空 = 删除一段代码，属破坏性操作：执行前确认。
+
+        其余替换是常规编辑，不确认（old_text 不匹配时 execute 本就会失败）。
+        """
+        if arguments.get("new_text", "") == "":
+            raw = arguments.get("path", "")
+            return RiskInfo(action="删除代码片段（替换为空）", detail=raw, files=[raw])
+        return None
 
     def execute(self, arguments: dict) -> ToolResult:
         raw = arguments.get("path", "")
