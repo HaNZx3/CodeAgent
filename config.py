@@ -27,6 +27,47 @@ def coding_agent_home() -> Path:
     return Path.home() / ".coding-agent"
 
 
+# 常见模型的原生上下文窗口（按模型名子串匹配、最长命中优先；未命中用默认值）。
+# 仅用于压缩阈值推导与占用显示——各家网关可能调整限制，配错时以 API 报错为准，
+# 可用 CODING_AGENT_CONTEXT_WINDOW 显式覆盖。
+DEFAULT_CONTEXT_WINDOW = 128_000
+MODEL_CONTEXT_WINDOWS: dict[str, int] = {
+    "gpt-4.1": 1_000_000,
+    "gpt-4o": 128_000,
+    "gpt-4-turbo": 128_000,
+    "gpt-4": 8_192,
+    "gpt-3.5": 16_384,
+    "deepseek": 64_000,
+    "qwen-turbo": 1_000_000,
+    "qwen-plus": 131_072,
+    "qwen": 131_072,
+    "kimi": 128_000,
+    "moonshot": 128_000,
+    "glm": 128_000,
+}
+
+
+def context_window_for_model(model: str) -> int:
+    """按模型名推断上下文窗口：子串最长命中优先，未命中回退默认值。
+
+    最长命中优先是为了让「gpt-4o」命中 128k 而不是被更短的「gpt-4」（8k）
+    抢走；「qwen3.8-max」这类名字则落到「qwen」条目上。
+    """
+    name = model.lower()
+    best_len = 0
+    window = DEFAULT_CONTEXT_WINDOW
+    for key, value in MODEL_CONTEXT_WINDOWS.items():
+        if key in name and len(key) > best_len:
+            best_len, window = len(key), value
+    return window
+
+
+# 未显式配置压缩阈值时，从窗口推导的默认比例。Claude Code 在 200K 窗口上
+# 的实际触发点约为原生窗口的 83%（200K − 20K 缓冲 − 13K 余量 = 167K），
+# 取 80% 与其同量级，同时给下一轮消息 + 回复留足空间。
+_COMPACT_THRESHOLD_RATIO = 0.8
+
+
 @dataclass
 class Config:
     """Agent 运行时配置。
@@ -52,10 +93,11 @@ class Config:
     command_timeout: float = 30.0
 
     # 上下文自动压缩
-    compact_threshold: int = 80_000   # 上次 API 返回的真实 prompt_tokens 超此值时自动压缩历史
+    # 阈值：from_env 未显式配置时按 context_window 的 80% 推导，与窗口联动。
+    compact_threshold: int = 80_000
     keep_recent: int = 6             # 压缩时保留最近 N 轮（一轮=user+后续 assistant/tool）
-    # 模型上下文窗口大小（仅用于 /status 与回复后指示条的占用百分比显示，
-    # 不参与压缩判断——压缩只看 compact_threshold 与真实 prompt_tokens）
+    # 模型上下文窗口：from_env 按模型名查表推断（可显式覆盖）。用于占用显示、
+    # 压缩阈值推导，以及 context.py 逼近上限时的兜底强制压缩。
     context_window: int = 128_000
 
     # 会话持久化
@@ -93,19 +135,30 @@ class Config:
         # 优先 OPENAI_API_KEY，兼容 DEEPSEEK_API_KEY 等常见命名。
         api_key = os.environ.get("OPENAI_API_KEY") or os.environ.get("DEEPSEEK_API_KEY") or ""
 
+        model = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
+        # 窗口：显式配置 > 按模型名查表推断。用于占用显示与压缩阈值推导。
+        window_env = os.environ.get("CODING_AGENT_CONTEXT_WINDOW")
+        context_window = int(window_env) if window_env else context_window_for_model(model)
+        # 压缩阈值：显式配置 > 从窗口推导（80%）。换小窗口模型时阈值随之缩小，
+        # 不会因沿用旧的大阈值而一直不压缩、直到请求超出窗口被 API 拒绝。
+        threshold_env = os.environ.get("CODING_AGENT_COMPACT_THRESHOLD")
+        compact_threshold = (
+            int(threshold_env) if threshold_env else int(context_window * _COMPACT_THRESHOLD_RATIO)
+        )
+
         return cls(
             api_key=api_key,
             base_url=os.environ.get("OPENAI_BASE_URL"),
-            model=os.environ.get("OPENAI_MODEL", "gpt-4o-mini"),
+            model=model,
             workspace=os.environ.get("CODING_AGENT_WORKSPACE", ""),
             max_steps=int(os.environ.get("CODING_AGENT_MAX_STEPS", "20")),
             max_runtime=float(os.environ.get("CODING_AGENT_MAX_RUNTIME", "300")),
             max_consecutive_errors=int(os.environ.get("CODING_AGENT_MAX_ERRORS", "3")),
             max_tool_output=int(os.environ.get("CODING_AGENT_MAX_TOOL_OUTPUT", "8192")),
             command_timeout=float(os.environ.get("CODING_AGENT_COMMAND_TIMEOUT", "30")),
-            compact_threshold=int(os.environ.get("CODING_AGENT_COMPACT_THRESHOLD", "80000")),
+            compact_threshold=compact_threshold,
             keep_recent=int(os.environ.get("CODING_AGENT_KEEP_RECENT", "6")),
-            context_window=int(os.environ.get("CODING_AGENT_CONTEXT_WINDOW", "128000")),
+            context_window=context_window,
             session_root=os.environ.get("CODING_AGENT_SESSION_ROOT")
             or str(coding_agent_home() / "sessions"),
             checkpoint_root=os.environ.get("CODING_AGENT_CHECKPOINT_ROOT")

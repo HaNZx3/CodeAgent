@@ -122,6 +122,7 @@ class CodingAgent:
             self.config.max_tool_output,
             compact_threshold=self.config.compact_threshold,
             keep_recent=self.config.keep_recent,
+            context_window=self.config.context_window,
             summarizer=_summarizer,
             store=self.store,
             session_id=session_id,

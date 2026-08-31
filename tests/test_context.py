@@ -376,3 +376,56 @@ def test_prune_callback_failure_does_not_break_compact():
     cm.last_prompt_tokens = 100
     cm.maybe_compact()  # 不应抛错
     assert "S" in cm.messages[1]["content"]  # 压缩本身成功
+
+
+# ── 爆窗兜底（逼近窗口上限强制压缩）────────────────────────────────────────
+
+
+def test_near_window_limit_compacts_below_threshold():
+    """阈值被配得比窗口还大时，逼近窗口上限仍强制压缩（兜底线 = 窗口 − 8K）。"""
+    cm = ContextManager("sys", compact_threshold=1_000_000, context_window=100_000,
+                        keep_recent=1, summarizer=lambda m: "S")
+    _seed_two_turns(cm)
+    cm.last_prompt_tokens = 95_000  # < 阈值 1M，但 >= 兜底线 92K
+    cm.maybe_compact()
+    assert "S" in cm.messages[1]["content"]
+
+
+def test_below_hard_limit_no_compact():
+    """未达阈值且离窗口上限尚远：不压缩。"""
+    cm = ContextManager("sys", compact_threshold=1_000_000, context_window=100_000,
+                        keep_recent=1, summarizer=lambda m: "S")
+    _seed_two_turns(cm)
+    cm.last_prompt_tokens = 50_000  # < 兜底线 92K
+    before = list(cm.get_messages())
+    cm.maybe_compact()
+    assert cm.get_messages() == before
+
+
+def test_tiny_window_hard_limit_clamped_to_60_percent():
+    """极小窗口下兜底线钳到不低于 60%，避免每轮都强制压缩。
+
+    窗口 8K：8K − 8K = 0 会被钳到 8K * 0.6 ≈ 4.9K。
+    tokens = 3K（< 4.9K）不压缩；tokens = 5K（>= 4.9K，仍 < 阈值 1M）压缩。
+    """
+    cm = ContextManager("sys", compact_threshold=1_000_000, context_window=8_192,
+                        keep_recent=1, summarizer=lambda m: "S")
+    _seed_two_turns(cm)
+    cm.last_prompt_tokens = 3_000
+    before = list(cm.get_messages())
+    cm.maybe_compact()
+    assert cm.get_messages() == before
+
+    cm.last_prompt_tokens = 5_000
+    cm.maybe_compact()
+    assert "S" in cm.messages[1]["content"]
+
+
+def test_effective_trigger_is_min_of_threshold_and_hard_limit():
+    """正常配置（阈值 < 兜底线）下行为不变：仍按阈值触发。"""
+    cm = ContextManager("sys", compact_threshold=1_000, context_window=128_000,
+                        keep_recent=1, summarizer=lambda m: "S")
+    _seed_two_turns(cm)
+    cm.last_prompt_tokens = 1_100  # >= 阈值，< 兜底线 120K
+    cm.maybe_compact()
+    assert "S" in cm.messages[1]["content"]

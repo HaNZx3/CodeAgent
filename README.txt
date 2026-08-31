@@ -12,8 +12,10 @@
 - Agent Loop 闭环：LLM -> 工具执行 -> 观测回传 -> 继续推理，直到给出最终回答
 - 六个本地工具：list_files / read_file / write_file / edit_file / search_code / run_command
   （workspace 沙箱边界，拒绝越界访问）
-- 上下文自动压缩：真实 prompt_tokens 超阈值时把旧轮次摘要成一条 system 消息，
-  保留最近 N 轮原文；按 user 轮次切分，保证 tool_call/tool 消息配对完整
+- 上下文自动压缩：按模型名自动推断上下文窗口（可显式覆盖），阈值默认取窗口
+  的 80% 与窗口联动；真实 prompt_tokens 超阈值时把旧轮次摘要成一条 system
+  消息，保留最近 N 轮原文；按 user 轮次切分，保证 tool_call/tool 消息配对完整；
+  逼近窗口上限时兜底强制压缩，换小窗口模型也不会爆窗
 - 会话持久化与隔离：每条消息同步落盘 JSONL，按 workspace 哈希分目录，
   进程退出后可 /resume 恢复；原子重写（.tmp + os.replace）防崩溃损坏
 - 高危操作确认：删除/覆写类操作执行前弹 y/N 确认（rm/del/rmdir/Remove-Item、
@@ -48,7 +50,9 @@
 ## 设计要点（核心逻辑说明，各文件 docstring 有完整动机）
 1. 对话历史与上下文管理（agent/context.py）
    维护发给模型的 messages 列表；工具输出按「前 6KB + 标记 + 后 2KB」截断；
-   压缩判断用上次 API 返回的真实 prompt_tokens（不估算），摘要消息带幂等前缀防再压缩。
+   窗口按模型名自动推断（可覆盖），压缩阈值默认取窗口 80%，另有逼近窗口上限
+   的兜底强制压缩；压缩判断用上次 API 返回的真实 prompt_tokens（不估算），
+   摘要消息带幂等前缀防再压缩。
 2. 工具定义与本地执行（tools/core.py + tools/*_tool.py）
    Tool 基类用 JSON Schema 声明参数并自动生成 tool 定义；ToolRegistry 统一调度，
    执行前按 Tool.risk() 做高危操作确认门控；工具失败不终止 Agent，
@@ -81,8 +85,8 @@
 每次任务完成的收尾行附带真实用量：
   ✓ 任务完成 · 上下文 930/128k (0.7%) · 本轮 2 次调用 1.1k tokens
 输入栏右下角同时常驻显示当前上下文占用与本会话累计 tokens（无任务前不显示）。
-所有数字均来自 API 返回的 usage 字段。窗口大小用
-CODING_AGENT_CONTEXT_WINDOW 配置（默认 128000，仅用于显示，不参与压缩判断）。
+所有数字均来自 API 返回的 usage 字段。窗口大小默认按模型名自动推断
+（见下），也可用 CODING_AGENT_CONTEXT_WINDOW 显式配置。
 
 ## 配置项（环境变量 / .env）
 OPENAI_API_KEY                  API Key（或 DEEPSEEK_API_KEY）
@@ -94,9 +98,11 @@ CODING_AGENT_MAX_RUNTIME        单任务最大运行秒数（默认 300）
 CODING_AGENT_MAX_ERRORS         最大连续工具失败次数（默认 3）
 CODING_AGENT_MAX_TOOL_OUTPUT    单条工具输出上限（默认 8192）
 CODING_AGENT_COMMAND_TIMEOUT    命令超时秒数（默认 30）
-CODING_AGENT_COMPACT_THRESHOLD  自动压缩阈值（默认 80000，按真实 prompt_tokens 判断）
+CODING_AGENT_COMPACT_THRESHOLD  自动压缩阈值（默认不设置时按窗口的 80% 自动推导）
 CODING_AGENT_KEEP_RECENT        压缩时保留最近轮数（默认 6）
-CODING_AGENT_CONTEXT_WINDOW     上下文窗口大小，仅用于占用显示（默认 128000）
+CODING_AGENT_CONTEXT_WINDOW     上下文窗口（默认按模型名推断：gpt-4o 128k、
+                                deepseek 64k、qwen 128k、gpt-4.1 1M 等；
+                                未识别的模型用 128k）
 CODING_AGENT_SESSION_ROOT       会话文件根目录（默认 ~/.coding-agent/sessions）
 CODING_AGENT_CHECKPOINTS        代码快照开关（默认 1 开启；git 缺失时自动降级）
 CODING_AGENT_CHECKPOINT_ROOT    快照根目录（默认 ~/.coding-agent/checkpoints）

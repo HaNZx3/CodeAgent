@@ -10,7 +10,8 @@
     1. 基础：追加 system/user/assistant/tool 消息，工具输出截断。
     2. 持久化：注入 store + session_id 后，每条消息同步落盘，进程重启后可 /resume <id> 恢复历史。
     3. 自动压缩：maybe_compact 在调 LLM 前调用，用上次 API 返回的真实 prompt_tokens
-       判断超阈值时，把旧轮次摘要成一段 system 消息，保留最近 keep_recent 轮原文。
+       判断是否触发——超阈值（默认按模型窗口的 80% 推导）或逼近窗口上限（兜底）
+       时，把旧轮次摘要成一段 system 消息，保留最近 keep_recent 轮原文。
        不估算，全部用真实数据。
 """
 
@@ -25,6 +26,11 @@ from tools.core import ToolResult, truncate_middle
 # 历史摘要消息在 messages[1] 的内容前缀；用于幂等守卫，避免对摘要再做摘要。
 _SUMMARY_PREFIX = "[Previous conversation summary]"
 
+# 爆窗兜底：距窗口上限多少 tokens 内无条件强制压缩（即使未达 compact_threshold）。
+# 阈值可能被配得比窗口还大（如换小窗口模型而沿用旧配置），兜底线保证不会
+# 一直不压缩、直到请求超出窗口被 API 拒绝。余量给下一轮 user 消息 + 回复留空间。
+_HARD_COMPACT_MARGIN = 8_000
+
 
 class ContextManager:
     def __init__(
@@ -34,6 +40,7 @@ class ContextManager:
         *,
         compact_threshold: int = 80_000,
         keep_recent: int = 6,
+        context_window: int = 128_000,
         summarizer: Callable[[list[dict]], str] | None = None,
         store=None,
         session_id: str | None = None,
@@ -45,6 +52,7 @@ class ContextManager:
         - max_tool_output: 单条工具输出上限，超出按「前 6KB + 标记 + 后 2KB」截断。
         - compact_threshold: 上次调用真实 prompt_tokens 超此值时触发 maybe_compact。
         - keep_recent:     压缩时保留最近 N 轮（一轮=user+后续 assistant/tool）原文。
+        - context_window:  模型上下文窗口，用于逼近上限时的兜底强制压缩。
         - summarizer:      把旧轮次摘要成字符串的回调；为 None 时优雅退化（不压缩）。
         - store + session_id: 注入后每条消息同步落盘，可跨进程恢复。
         - on_user_turns_pruned: 压缩丢弃旧用户轮次后回调（参数=丢弃数），
@@ -53,6 +61,7 @@ class ContextManager:
         self.max_tool_output = max_tool_output
         self.compact_threshold = compact_threshold
         self.keep_recent = keep_recent
+        self.context_window = context_window
         self._summarizer = summarizer
         self.store = store
         self.session_id = session_id
@@ -156,7 +165,12 @@ class ContextManager:
         return removed
 
     def maybe_compact(self, force: bool = False) -> None:
-        """超阈值时把旧轮次压缩成一段 summary system 消息。
+        """超阈值或逼近窗口上限时，把旧轮次压缩成一段 summary system 消息。
+
+        触发线取两者较小值（双触发，Claude Code 同款思路）：
+          1. 常规阈值 compact_threshold——上下文长了就整理，保持低占用；
+          2. 爆窗兜底线（窗口 − 8K，极小窗口下不低于 60%）——阈值被配得
+             比窗口还大时，逼近上限也强制压缩，避免请求被 API 直接拒绝。
 
         切分按「对话轮次」而非消息数，保证 recent 段以 user 开头、
         内部 assistant(tool_calls)+tool 配对完整——否则 OpenAI 兼容 API
@@ -164,13 +178,19 @@ class ContextManager:
 
         summarizer 失败时静默跳过，不让一次压缩失败拖垮整个 run。
         """
-        # 只看真实 token：上次 API 返回的 prompt_tokens。None 表示尚未调用过 LLM，
-        # 此时无法判断阈值——不压缩，等首次调用拿到 usage 后再说。不估算。
-        if not force and (
-            self.last_prompt_tokens is None
-            or self.last_prompt_tokens < self.compact_threshold
-        ):
-            return
+        # 只看真实 token：上次 API 返回的 prompt_tokens。None 表示尚未调用过
+        # LLM，此时无法判断——不压缩，等首次调用拿到 usage 后再说。不估算。
+        tokens = self.last_prompt_tokens
+        if not force:
+            if tokens is None:
+                return
+            # 兜底线在极小窗口下钳到不低于 60%，避免每轮都强制压缩。
+            hard_limit = max(
+                self.context_window - _HARD_COMPACT_MARGIN,
+                self.context_window * 3 // 5,
+            )
+            if tokens < min(self.compact_threshold, hard_limit):
+                return
         if not self._summarizer:
             return  # 优雅退化：未注入摘要器时不压缩
         # 幂等守卫：messages[1] 已是摘要则不重复压缩。
