@@ -49,9 +49,10 @@
 1. 对话历史与上下文管理（agent/context.py）
    维护发给模型的 messages 列表；工具输出按「前 6KB + 标记 + 后 2KB」截断；
    压缩判断用上次 API 返回的真实 prompt_tokens（不估算），摘要消息带幂等前缀防再压缩。
-2. 工具定义与本地执行（tools/）
-   Tool 基类用 JSON Schema 声明参数并自动生成 tool 定义；registry 统一分发；
-   工具失败不终止 Agent，而是把错误写回上下文让模型自行恢复。
+2. 工具定义与本地执行（tools/core.py + tools/*_tool.py）
+   Tool 基类用 JSON Schema 声明参数并自动生成 tool 定义；ToolRegistry 统一调度，
+   执行前按 Tool.risk() 做高危操作确认门控；工具失败不终止 Agent，
+   而是把错误写回上下文让模型自行恢复。
 3. 模型输出解析（llm/client.py）
    把各厂商响应标准化为 ModelResponse / ToolCall；流式模式下 tool_call 参数
    分片按 index 拼槽，上层无感；usage 从最后一个 chunk 提取真实值。
@@ -101,11 +102,30 @@ CODING_AGENT_CHECKPOINTS        代码快照开关（默认 1 开启；git 缺�
 CODING_AGENT_CHECKPOINT_ROOT    快照根目录（默认 ~/.coding-agent/checkpoints）
 
 ## 目录结构
-agent/   Agent 状态与循环（loop / context / stop / session / memory / checkpoints）
-llm/     模型 API 通信与响应标准化
-tools/   工具定义与本地执行（core 抽象与调度 / file / search / shell / workspace 边界）
-demo/    演示用小型 Python 项目（含故意植入的 bug）
-tests/   自动化测试（tool / context / agent loop / session / memory / checkpoint / 命令层）
+main.py            CLI 入口：交互式 REPL（命令菜单 / spinner / 用量显示）与一次性任务
+config.py          全局配置：.env / 环境变量加载，集中管理各项阈值与路径
+
+agent/             Agent 状态与循环
+  agent.py         CodingAgent 装配层：把 llm / tools / context / stop / loop 组装成 Agent
+  loop.py          Agent Loop：LLM -> 工具执行 -> 观测回传 -> 继续推理，直到最终回答
+  context.py       上下文管理：messages 维护、工具输出截断、真实 token 驱动自动压缩
+  stop.py          停止条件：最大步数 / 最大运行时间 / 连续工具失败
+  session.py       会话持久化：JSONL 原子落盘、按 workspace 隔离、/resume 恢复
+  memory.py        项目记忆：workspace/AGENT.md 与 ~/.coding-agent/USER.md 注入
+  checkpoints.py   代码快照：影子 git 仓库按轮次记录 workspace，供 /back 精确回退
+
+llm/               模型 API 通信
+  client.py        OpenAI 兼容客户端、流式分片解析、ModelResponse / ToolCall 标准化
+
+tools/             工具定义与本地执行
+  core.py          抽象与调度：Tool 基类 / ToolResult / RiskInfo / ToolRegistry 确认门控
+  workspace.py     Workspace 沙箱边界校验与遍历目录过滤
+  file_tools.py    list_files / read_file / write_file / edit_file
+  search_tool.py   search_code
+  shell_tool.py    run_command（灾难级硬拒 + 破坏性命令确认）
+
+demo/              演示用小型 Python 项目（含故意植入的 bug）
+tests/             自动化测试（tool / context / agent loop / session / memory / checkpoint / 命令层）
 
 ## 运行测试
 pytest tests/
