@@ -1,8 +1,7 @@
 """Agent Loop 测试：用 FakeLLM 模拟「tool call -> result -> ... -> final」的循环。"""
 
 from llm.client import ModelResponse, ToolCall
-from tools.base import Tool, ToolResult
-from tools.registry import ToolRegistry
+from tools.core import Tool, ToolResult, ToolRegistry
 from agent.context import ContextManager
 from agent.stop import StopController
 from agent.loop import AgentLoop
@@ -246,7 +245,7 @@ def test_on_step_start_fires_with_tool_name_and_args():
     assert len(result.steps) == 1
 
 
-# ── Phase 1+2：上下文压缩与会话隔离集成 ──────────────────────────────────
+# ── 上下文压缩与会话隔离集成 ────────────────────────────────────────────────
 
 
 def test_maybe_compact_called_in_loop_before_llm():
@@ -486,7 +485,7 @@ def test_usage_absent_llm_yields_zero_usage():
     assert result.usage["prompt_tokens"] == 0
 
 
-# ── Phase 4：代码快照与对话回退的 Agent 装配 ──────────────────────────────
+# ── 代码快照与对话回退的 Agent 装配 ────────────────────────────────────────
 
 
 def test_agent_checkpoint_wiring(tmp_path):

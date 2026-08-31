@@ -39,3 +39,15 @@ class Workspace:
                 f"路径越界，禁止访问 workspace 之外的位置: {path}"
             )
         return candidate
+
+
+# list_files / search 遍历时忽略的目录（VCS、缓存、构建产物等）。
+IGNORED_DIRS = {
+    ".git", "node_modules", "__pycache__", ".venv", "venv",
+    ".idea", ".vscode", ".pytest_cache", "dist", "build", ".mypy_cache",
+}
+
+
+def prune_ignored_dirs(dirnames: list[str]) -> None:
+    """原地剔除忽略目录与隐藏目录，避免 .git/node_modules 等撑爆遍历输出。"""
+    dirnames[:] = [d for d in dirnames if d not in IGNORED_DIRS and not d.startswith(".")]

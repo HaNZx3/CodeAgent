@@ -32,11 +32,15 @@ class StopController:
         self._start: float | None = None
 
     def start(self) -> None:
+        """任务开始计时。由 Agent Loop 在压缩完成、正式进入循环前调用，
+        确保 summarizer 耗时不计入 max_runtime。"""
         self._start = time.monotonic()
 
     def runtime_exceeded(self) -> bool:
+        """是否超过最大运行时间。未 start 过会显式报错，避免静默放行。"""
         assert self._start is not None, "请先调用 start()"
         return (time.monotonic() - self._start) > self.max_runtime
 
     def errors_exceeded(self, consecutive_errors: int) -> bool:
+        """连续工具失败次数是否达上限。达上限即停，避免反复撞同一错误。"""
         return consecutive_errors >= self.max_consecutive_errors

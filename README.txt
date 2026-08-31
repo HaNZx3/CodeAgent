@@ -103,7 +103,7 @@ CODING_AGENT_CHECKPOINT_ROOT    快照根目录（默认 ~/.coding-agent/checkpo
 ## 目录结构
 agent/   Agent 状态与循环（loop / context / stop / session / memory / checkpoints）
 llm/     模型 API 通信与响应标准化
-tools/   工具定义与本地执行（file / search / shell / workspace 边界）
+tools/   工具定义与本地执行（core 抽象与调度 / file / search / shell / workspace 边界）
 demo/    演示用小型 Python 项目（含故意植入的 bug）
 tests/   自动化测试（tool / context / agent loop / session / memory / checkpoint / 命令层）
 

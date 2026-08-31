@@ -2,8 +2,7 @@
 
 import pytest
 
-from tools.base import RiskInfo
-from tools.registry import ToolRegistry
+from tools.core import RiskInfo, ToolRegistry
 from tools.workspace import Workspace
 from tools.file_tools import ListFilesTool, ReadFileTool, WriteFileTool, EditFileTool
 from tools.search_tool import SearchTool

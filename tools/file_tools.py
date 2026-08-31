@@ -8,14 +8,8 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from .base import RiskInfo, Tool, ToolResult
-from .workspace import Workspace, WorkspaceError
-
-# list_files / search 需要忽略的目录
-IGNORED_DIRS = {
-    ".git", "node_modules", "__pycache__", ".venv", "venv",
-    ".idea", ".vscode", ".pytest_cache", "dist", "build", ".mypy_cache",
-}
+from .core import RiskInfo, Tool, ToolResult
+from .workspace import Workspace, WorkspaceError, prune_ignored_dirs
 
 MAX_READ_BYTES = 200 * 1024  # read_file 单次最多读取 200KB
 
@@ -36,6 +30,7 @@ class ListFilesTool(Tool):
         self.workspace = workspace
 
     def execute(self, arguments: dict) -> ToolResult:
+        """列出 workspace 内某目录的树形结构（限深度），展示项目布局。"""
         try:
             root = self.workspace.resolve(arguments.get("path", "."))
         except WorkspaceError as e:
@@ -48,12 +43,11 @@ class ListFilesTool(Tool):
         return ToolResult.ok("\n".join(lines) if lines else "(空目录)")
 
     def _walk(self, root: Path, max_depth: int) -> list[str]:
+        """os.walk 遍历并格式化为缩进树，忽略无关目录、限制深度。"""
         lines: list[str] = []
         for dirpath, dirnames, filenames in os.walk(root):
             # 剔除无关目录，避免 .git/node_modules 等撑爆输出
-            dirnames[:] = [
-                d for d in dirnames if d not in IGNORED_DIRS and not d.startswith(".")
-            ]
+            prune_ignored_dirs(dirnames)
             rel = Path(dirpath).relative_to(root)
             current_depth = len(rel.parts)
             if current_depth > max_depth:
@@ -87,6 +81,7 @@ class ReadFileTool(Tool):
         self.workspace = workspace
 
     def execute(self, arguments: dict) -> ToolResult:
+        """以 UTF-8 读取文本文件全文；越界 / 过大 / 非文本均返回失败。"""
         raw = arguments.get("path", "")
         try:
             path = self.workspace.resolve(raw)
@@ -144,6 +139,7 @@ class WriteFileTool(Tool):
         return None
 
     def execute(self, arguments: dict) -> ToolResult:
+        """创建新文件或完整覆盖已有文件（父目录自动创建）。"""
         raw = arguments.get("path", "")
         try:
             path = self.workspace.resolve(raw)
@@ -190,6 +186,7 @@ class EditFileTool(Tool):
         return None
 
     def execute(self, arguments: dict) -> ToolResult:
+        """精确替换文件中首次出现的 old_text；old_text 不匹配则失败（避免误改）。"""
         raw = arguments.get("path", "")
         try:
             path = self.workspace.resolve(raw)

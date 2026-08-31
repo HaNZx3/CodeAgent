@@ -11,9 +11,8 @@ import os
 import re
 from pathlib import Path
 
-from .base import Tool, ToolResult
-from .file_tools import IGNORED_DIRS
-from .workspace import Workspace, WorkspaceError
+from .core import Tool, ToolResult
+from .workspace import Workspace, WorkspaceError, prune_ignored_dirs
 
 TEXT_EXTENSIONS = {
     ".py", ".txt", ".md", ".json", ".yaml", ".yml", ".toml",
@@ -39,6 +38,7 @@ class SearchTool(Tool):
         self.workspace = workspace
 
     def execute(self, arguments: dict) -> ToolResult:
+        """按关键词（子串或正则）在目录内搜索代码，返回 文件:行号 列表。"""
         query = arguments.get("query", "")
         if not query:
             return ToolResult.fail("query 不能为空")
@@ -60,9 +60,7 @@ class SearchTool(Tool):
 
         matches: list[str] = []
         for dirpath, dirnames, filenames in os.walk(root):
-            dirnames[:] = [
-                d for d in dirnames if d not in IGNORED_DIRS and not d.startswith(".")
-            ]
+            prune_ignored_dirs(dirnames)
             for f in sorted(filenames):
                 if f.startswith("."):
                     continue
@@ -84,6 +82,7 @@ class SearchTool(Tool):
 
     @staticmethod
     def _format(matches: list[str]) -> str:
+        """把匹配行列表格式化为带计数的可读文本。"""
         if not matches:
             return "未找到匹配结果"
         return f"共 {len(matches)} 条匹配:\n" + "\n".join(matches)

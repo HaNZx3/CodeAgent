@@ -7,7 +7,7 @@ from pathlib import Path
 
 from config import Config
 from llm.client import LLMClient
-from tools.registry import ToolRegistry
+from tools.core import ToolRegistry
 from tools.workspace import Workspace
 from tools.file_tools import ListFilesTool, ReadFileTool, WriteFileTool, EditFileTool
 from tools.search_tool import SearchTool
@@ -44,12 +44,8 @@ class CodingAgent:
         self.registry = self._build_registry()
 
         # 会话持久化存储：每个 workspace 一个子目录，进程退出后可 /resume。
-        session_root = (
-            Path(config.session_root)
-            if config.session_root
-            else (Path.home() / ".coding-agent" / "sessions")
-        )
-        self.store = SessionStore(session_root, config.workspace)
+        # session_root 默认值在 Config.from_env 里算好（~/.coding-agent/sessions）。
+        self.store = SessionStore(Path(config.session_root), config.workspace)
 
         # 初始会话：每次启动开一个新 session_id。
         # resume 走 switch_session，由 REPL 命令触发。
@@ -57,13 +53,9 @@ class CodingAgent:
 
         # 代码快照：影子 git 仓库按轮次记录 workspace 状态，供 /back 还原代码。
         # git 缺失或命令失败时内部自动禁用（enabled=False），不影响对话功能。
-        ckpt_root = (
-            Path(config.checkpoint_root)
-            if config.checkpoint_root
-            else (Path.home() / ".coding-agent" / "checkpoints")
-        )
+        # checkpoint_root 默认值在 Config.from_env 里算好（~/.coding-agent/checkpoints）。
         self.checkpoints = CheckpointStore(
-            ckpt_root, config.workspace, self._session_id, enabled=config.checkpoints
+            Path(config.checkpoint_root), config.workspace, self._session_id, enabled=config.checkpoints
         )
 
         self.context = self._make_context(self._session_id)

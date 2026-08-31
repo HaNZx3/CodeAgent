@@ -3,7 +3,7 @@
 import pytest
 
 from llm.client import ModelResponse, ToolCall
-from tools.base import ToolResult
+from tools.core import ToolResult
 from agent.context import ContextManager
 
 
@@ -52,30 +52,21 @@ def test_tool_output_truncated():
     assert "truncated" in content
 
 
-def test_clear_resets_to_system_prompt_only():
+def test_reset_clears_history_keeps_system_prompt():
     # /clear 命令依赖此方法：清空历史但保留 system prompt，开启新对话。
     cm = ContextManager("sys")
     cm.add_user("task1")
     cm.add_assistant(ModelResponse(text="answer1"))
     assert len(cm.get_messages()) == 3  # system + user + assistant
 
-    cm.clear()
+    cm.reset()
 
     msgs = cm.get_messages()
     assert len(msgs) == 1
     assert msgs[0] == {"role": "system", "content": "sys"}
 
 
-def test_clear_can_replace_system_prompt():
-    cm = ContextManager("old")
-    cm.add_user("x")
-    cm.clear("new system prompt")
-    msgs = cm.get_messages()
-    assert len(msgs) == 1
-    assert msgs[0]["content"] == "new system prompt"
-
-
-# ── Phase 1：自动压缩 ────────────────────────────────────────────────────
+# ── 自动压缩 ────────────────────────────────────────────────────────────────
 
 
 def test_maybe_compact_noop_below_threshold():
@@ -258,7 +249,7 @@ def test_last_prompt_tokens_drives_threshold():
     assert "S" in msgs[1]["content"]
 
 
-# ── Phase 2：会话持久化 ──────────────────────────────────────────────────
+# ── 会话持久化 ──────────────────────────────────────────────────────────────
 
 
 def test_persisted_messages_on_add_user(tmp_path):
@@ -288,7 +279,7 @@ def test_persisted_messages_on_add_tool_result(tmp_path):
     assert loaded[1]["content"] == "data"
 
 
-# ── Phase 4：对话回退（/back） ────────────────────────────────────────────
+# ── 对话回退（/back） ────────────────────────────────────────────────────────
 
 
 def _seed_two_turns(cm):

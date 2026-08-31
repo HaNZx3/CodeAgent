@@ -1,6 +1,6 @@
 """Shell 工具：在 workspace 内执行命令。
 
-这是最需要限制的工具。第一版不追求操作系统级沙箱，但必须画出明确的安全边界：
+这是最需要限制的工具。不追求操作系统级沙箱，但必须画出明确的安全边界：
     1. cwd 固定为 workspace
     2. 灾难级命令（rm -rf /、format、mkfs、dd、关机重启…）硬拒绝
     3. 破坏性但可经 /back 找回的命令（rm / del / rmdir / Remove-Item、
@@ -14,7 +14,7 @@ from __future__ import annotations
 import re
 import subprocess
 
-from .base import RiskInfo, Tool, ToolResult
+from .core import RiskInfo, Tool, ToolResult, truncate_middle
 from .workspace import Workspace, WorkspaceError
 
 MAX_OUTPUT = 8000  # 每个流最多保留的字符数
@@ -157,8 +157,5 @@ class ShellTool(Tool):
 
     @staticmethod
     def _trim(text: str) -> str:
-        if len(text) <= MAX_OUTPUT:
-            return text
-        head = int(MAX_OUTPUT * 0.8)
-        tail = int(MAX_OUTPUT * 0.2)
-        return text[:head] + "\n...[output truncated]...\n" + text[-tail:]
+        """超长输出按「前 80% + 标记 + 后 20%」截断（MAX_OUTPUT 为每流上限）。"""
+        return truncate_middle(text, MAX_OUTPUT, head_ratio=0.8)

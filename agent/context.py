@@ -6,13 +6,12 @@
     同时，工具输出可能非常大（一次 pytest 日志），必须截断，
     否则会撑爆上下文窗口。
 
-三阶段能力：
+能力：
     1. 基础：追加 system/user/assistant/tool 消息，工具输出截断。
-    2. 持久化（Phase 2）：注入 store + session_id 后，每条消息同步落盘，
-       进程重启后可 /resume <id> 恢复历史。
-    3. 自动压缩（Phase 1）：maybe_compact 在调 LLM 前调用，用上次 API 返回的
-       真实 prompt_tokens 判断超阈值时，把旧轮次摘要成一段 system 消息，
-       保留最近 keep_recent 轮原文。不估算，全部用真实数据。
+    2. 持久化：注入 store + session_id 后，每条消息同步落盘，进程重启后可 /resume <id> 恢复历史。
+    3. 自动压缩：maybe_compact 在调 LLM 前调用，用上次 API 返回的真实 prompt_tokens
+       判断超阈值时，把旧轮次摘要成一段 system 消息，保留最近 keep_recent 轮原文。
+       不估算，全部用真实数据。
 """
 
 from __future__ import annotations
@@ -21,7 +20,7 @@ import json
 from collections.abc import Callable
 
 from llm.client import ModelResponse, ToolCall
-from tools.base import ToolResult
+from tools.core import ToolResult, truncate_middle
 
 # 历史摘要消息在 messages[1] 的内容前缀；用于幂等守卫，避免对摘要再做摘要。
 _SUMMARY_PREFIX = "[Previous conversation summary]"
@@ -72,7 +71,7 @@ class ContextManager:
 
         会话文件同步删除——否则内存已清空而文件还在，下次 add_user
         会把新消息 append 到旧历史后面，/resume 会得到不一致的状态。
-        last_prompt_tokens 一并归零：清空后旧的真实用量不再代表当前上下文。
+        last_prompt_tokens 一并归零：清空前的真实用量不再代表当前上下文。
         """
         self.messages = [self.messages[0]]
         self.last_prompt_tokens = None
@@ -127,15 +126,6 @@ class ContextManager:
 
     def get_messages(self) -> list[dict]:
         return self.messages
-
-    def clear(self, system_prompt: str | None = None) -> None:
-        """清空对话历史（内存）。保留原 system prompt，或替换为新的。
-
-        注意：本方法只清内存，不删 session 文件。如需「开新会话保留旧文件」
-        的语义，应在 Agent 层调用 new_session()，而不是直接 clear()。
-        """
-        prompt = system_prompt if system_prompt is not None else self.messages[0]["content"]
-        self.messages = [{"role": "system", "content": prompt}]
 
     def user_turns(self) -> list[int]:
         """可回退的用户消息索引（/back 的候选列表）。
@@ -225,10 +215,7 @@ class ContextManager:
 
         不够 keep_recent 轮时返回 -1（不压缩）。
         """
-        user_indices = [
-            i for i, m in enumerate(self.messages)
-            if i > 0 and m.get("role") == "user"
-        ]
+        user_indices = self.user_turns()
         if len(user_indices) <= self.keep_recent:
             return -1
         return user_indices[-self.keep_recent]
@@ -240,9 +227,4 @@ class ContextManager:
 
     def _truncate(self, text: str) -> str:
         """超过上限时保留「前 6KB + 标记 + 后 2KB」（默认 8KB）。"""
-        limit = self.max_tool_output
-        if len(text) <= limit:
-            return text
-        head = int(limit * 0.75)
-        tail = int(limit * 0.25)
-        return text[:head] + "\n...[output truncated]...\n" + text[-tail:]
+        return truncate_middle(text, self.max_tool_output, head_ratio=0.75)

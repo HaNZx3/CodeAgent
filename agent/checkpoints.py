@@ -19,7 +19,7 @@
       文件（checkout <hash> -- . 做不到）。还原前先打一个「安全快照」
       commit，保证任何还原本身可撤销——还原前的状态永远在影子仓库里找得回。
     - 精确回退（/back 默认）：全量还原会把其它会话在目标快照之后的改动
-      一并抹掉。restore_precise 改为反向 apply 一系列 (起点快照 → 链上
+      一并抹掉。restore_precise 采用反向 apply 一系列 (起点快照 → 链上
       下一个快照) 的区间 diff：快照在每轮开始时打，这段 diff 恰是以该
       快照为起点的那轮的私有改动；只选本会话条目对应的区间，其它会话的
       工作天然保留。restore 前创建的安全快照恰好充当「最后一轮之后缺失
@@ -416,13 +416,6 @@ class CheckpointStore:
                 pairs.append((P, chain[i + 1]))
         return pairs
 
-    def _pair_files(self, pair: tuple[str, str]) -> list[str]:
-        P, C = pair
-        r = self._run("diff", "--name-only", "--no-renames", "--no-color", P, C)
-        if r.returncode != 0:
-            return []
-        return [line for line in r.stdout.splitlines() if line.strip()]
-
     def _pair_status(self, pair: tuple[str, str]) -> list[tuple[str, str]]:
         """区间内各文件的变更类型 [(A/D/M/T, path)]。"""
         P, C = pair
@@ -531,7 +524,7 @@ class CheckpointStore:
                 continue
             i = pos.get(P)
             if i is not None and i + 1 < len(chain):
-                cand = self._pair_files((P, chain[i + 1]))
+                cand = self._diff_names(P, chain[i + 1], no_renames=True)
             else:
                 cand = self._worktree_diff_files(P)
             for f in cand:
@@ -572,13 +565,22 @@ class CheckpointStore:
                 self._run("reset", "--hard", safety)
                 self._run("clean", "-fd")
                 return PreciseResult(ok=False, safety=safety, files=conflicts)
-            for f in self._pair_files(pair):
+            for f in self._diff_names(*pair, no_renames=True):
                 if f not in reverted:
                     reverted.append(f)
         return PreciseResult(ok=True, safety=safety, files=reverted)
 
-    def _diff_names(self, a: str, b: str) -> list[str]:
-        r = self._run("diff", "--name-only", a, b)
+    def _diff_names(self, a: str, b: str, *, no_renames: bool = False) -> list[str]:
+        """git diff --name-only [a..b] 的文件列表。
+
+        no_renames=True 时加 --no-renames --no-color（区间私有改动需禁用
+        重命名检测，把「改名」统一成「删除+新建」，反向 apply 才能逐文件处理）。
+        """
+        args = ["diff", "--name-only"]
+        if no_renames:
+            args += ["--no-renames", "--no-color"]
+        args += [a, b]
+        r = self._run(*args)
         if r.returncode != 0:
             return []
         return [line for line in r.stdout.splitlines() if line.strip()]

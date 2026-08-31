@@ -11,6 +11,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from config import coding_agent_home
+
 
 def load_project_memory(workspace: str | Path) -> str:
     """读取 workspace/AGENT.md 和 ~/.coding-agent/USER.md，拼成 system prompt 段落。
@@ -27,7 +29,7 @@ def load_project_memory(workspace: str | Path) -> str:
     except OSError:
         pass
 
-    user = Path.home() / ".coding-agent" / "USER.md"
+    user = coding_agent_home() / "USER.md"
     try:
         content = user.read_text(encoding="utf-8").strip()
         if content:

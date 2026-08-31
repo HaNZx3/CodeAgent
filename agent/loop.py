@@ -13,7 +13,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from llm.client import LLMClient
-from tools.registry import ToolRegistry
+from tools.core import ToolRegistry
 from .context import ContextManager
 from .stop import StopController
 
@@ -73,7 +73,7 @@ class AgentLoop:
         tool_name 为 None 的 StepRecord 表示模型的过程说明。
 
         on_text 可选：开启流式。模型输出的文本增量实时转发（打字机效果）；
-        此时过程说明已通过流式渠道展示，不再走 on_step，避免重复打印。
+        此时过程说明已通过流式渠道展示，故不走 on_step，避免重复打印。
 
         on_step_start 可选：工具开始执行前回调（带工具名与参数），
         供 CLI 在工具执行期间显示 spinner 等加载状态。

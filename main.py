@@ -19,7 +19,7 @@ from pathlib import Path
 from config import Config
 from agent.agent import CodingAgent
 from agent.loop import RunResult, StepRecord
-from tools.base import RiskInfo
+from tools.core import RiskInfo
 
 
 # ── ANSI 颜色 ──────────────────────────────────────────────────────────────
@@ -161,7 +161,7 @@ class _TurnView:
     def finish(self, result: RunResult) -> None:
         """收尾：最终回答已流式展示，这里只补一行收尾标记（含本轮用量）。
 
-        上下文规模不再在此重复——它已由输入栏右下角常驻显示，收尾行只报
+        上下文规模不在此重复——已由输入栏右下角常驻显示，收尾行只报
         本轮消耗，避免与状态栏信息冗余。
         """
         self._spinner.stop()
@@ -460,7 +460,7 @@ def _handle_back(agent: CodingAgent, arg: str) -> None:
     # ── 选择回退点 ──
     n: int | None = None
     if arg.isdigit() and 1 <= int(arg) <= len(turns):
-        n = int(arg)  # /back <n> 直接回退，不再询问
+        n = int(arg)  # /back <n> 直接回退，跳过候选菜单
     else:
         print(f"{C.CYAN}回退到哪条消息之前？{C.RESET}")
         for i, idx in enumerate(turns, 1):
