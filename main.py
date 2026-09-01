@@ -402,8 +402,17 @@ def _readline(prompt: str, status=None) -> str:
     while True:
         ms = [] if esc_closed else _matches()
         ch = msvcrt.getwch()
-        if ch == "\r":  # Enter：提交（菜单打开时先补全选中命令）
-            # 多行 buf 也能直接回车提交；菜单打开时补全选中项
+        if ch == "\r":  # Enter
+            # 行尾反斜杠续行：把 \ 替换成换行，不提交（shell 式续行）。
+            # Windows 控制台无法区分 Shift+Enter 与 Enter（均返回 \r），
+            # 用 \ + Enter 作为可发现的换行方式，与 Ctrl+J 并存。
+            if buf.endswith("\\") and not ms:
+                buf = buf[:-1] + "\n"
+                esc_closed = False
+                sel = 0
+                _draw()
+                continue
+            # 提交：菜单打开时补全选中项；多行 buf 也能直接回车提交
             if ms:
                 buf = ms[min(sel, len(ms) - 1)]
             sys.stdout.write("\r\033[K" + prompt + buf + "\n\033[J")
@@ -793,7 +802,7 @@ def _run_once(agent: CodingAgent, task: str) -> None:
 
 def _run_repl(agent: CodingAgent, config: Config) -> None:
     print(f"{C.GRAY}输入任务开始，/help 查看命令，/exit 退出；"
-          f"多行输入按 Ctrl+J 换行，运行中按 Ctrl+C 中断{C.RESET}\n")
+          f"多行输入按行尾 \\ 或 Ctrl+J 换行，运行中按 Ctrl+C 中断{C.RESET}\n")
     # 输入栏右下角常驻状态的数据：全部取自 API 返回的真实 usage。
     # ctx = 最近一次调用的 prompt_tokens（即当前上下文规模），
     # total = 本会话累计消耗 tokens。

@@ -22,7 +22,7 @@
 - 项目记忆：workspace/AGENT.md 与 ~/.coding-agent/USER.md 注入 system prompt
 - Claude Code 式体验：输入 / 弹命令菜单（前缀过滤、↑↓ 选择、Tab 补全），
   输入栏右下角常驻真实用量，流式打字机输出，工具执行 spinner；
-  多行输入按 Ctrl+J 换行；运行中按 Ctrl+C 即时打断 LLM 调用，返回输入栏重新提问
+  多行输入按行尾 \\ 或 Ctrl+J 换行；运行中按 Ctrl+C 即时打断 LLM 调用，返回输入栏重新提问
 
 ## 快速开始
 1. 安装：pip install -e ".[dev]"     # 含 pytest；仅运行用 pip install -e .
