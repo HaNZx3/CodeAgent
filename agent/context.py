@@ -164,7 +164,7 @@ class ContextManager:
             self.store.rewrite(self.session_id, self.messages[1:])
         return removed
 
-    def maybe_compact(self, force: bool = False) -> None:
+    def maybe_compact(self, force: bool = False) -> str:
         """超阈值或逼近窗口上限时，把旧轮次压缩成一段 summary system 消息。
 
         触发线取两者较小值（双触发，Claude Code 同款思路）：
@@ -177,39 +177,46 @@ class ContextManager:
         会因孤立 tool 消息直接 400。
 
         summarizer 失败时静默跳过，不让一次压缩失败拖垮整个 run。
+
+        返回结果码，供 /compact 区分展示（自动路径忽略返回值）：
+          "ok"              压缩成功；
+          "already_summary" 历史已是摘要（幂等守卫）；
+          "few_turns"       user 轮次不足，没有可压缩的旧轮次；
+          "failed"          summarizer 异常，已保留原 messages；
+          "noop"            其他无需压缩情形（未达阈值/无 summarizer 等）。
         """
         # 只看真实 token：上次 API 返回的 prompt_tokens。None 表示尚未调用过
         # LLM，此时无法判断——不压缩，等首次调用拿到 usage 后再说。不估算。
         tokens = self.last_prompt_tokens
         if not force:
             if tokens is None:
-                return
+                return "noop"
             # 兜底线在极小窗口下钳到不低于 60%，避免每轮都强制压缩。
             hard_limit = max(
                 self.context_window - _HARD_COMPACT_MARGIN,
                 self.context_window * 3 // 5,
             )
             if tokens < min(self.compact_threshold, hard_limit):
-                return
+                return "noop"
         if not self._summarizer:
-            return  # 优雅退化：未注入摘要器时不压缩
+            return "noop"  # 优雅退化：未注入摘要器时不压缩
         # 幂等守卫：messages[1] 已是摘要则不重复压缩。
         if (
             len(self.messages) > 1
             and isinstance(self.messages[1].get("content"), str)
             and self.messages[1]["content"].startswith(_SUMMARY_PREFIX)
         ):
-            return
+            return "already_summary"
         cut = self._find_compact_split()
         if cut <= 0:
-            return  # 不够轮次，无法压缩
+            return "few_turns"  # 不够轮次，无法压缩
         old = self.messages[1:cut]
         if not old:
-            return  # 极端情况：无旧消息可压缩
+            return "noop"  # 极端情况：无旧消息可压缩
         try:
             summary = self._summarizer(old)
         except Exception:
-            return  # 压缩失败：保留原 messages，主流程继续
+            return "failed"  # 压缩失败：保留原 messages，主流程继续
         self.messages = (
             self.messages[:1]
             + [{"role": "system", "content": f"{_SUMMARY_PREFIX}\n{summary}"}]
@@ -226,6 +233,7 @@ class ContextManager:
                 self._on_user_turns_pruned(dropped)
             except Exception:
                 pass
+        return "ok"
 
     def _find_compact_split(self) -> int:
         """返回 messages 上一个安全切分点索引。

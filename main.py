@@ -782,9 +782,20 @@ def _handle_command(agent: CodingAgent, cmd: str, config: Config) -> bool:
         return True
     if name == "/compact":
         before = len(agent.context.get_messages())
-        agent.context.maybe_compact(force=True)
+        result = agent.context.maybe_compact(force=True)
         after = len(agent.context.get_messages())
-        print(f"{C.GREEN}✓ 压缩完成{C.RESET}  {C.GRAY}消息数 {before} -> {after}{C.RESET}")
+        if result == "ok":
+            print(f"{C.GREEN}✓ 压缩完成{C.RESET}  "
+                  f"{C.GRAY}消息数 {before} -> {after}{C.RESET}")
+        elif result == "already_summary":
+            print(f"{C.GRAY}· 无需压缩：历史已是摘要{C.RESET}")
+        elif result == "few_turns":
+            print(f"{C.GRAY}· 无需压缩：对话轮次不足"
+                  f"（保留最近 {agent.context.keep_recent} 轮）{C.RESET}")
+        elif result == "failed":
+            print(f"{C.RED}· 压缩失败：已保留原对话{C.RESET}")
+        else:
+            print(f"{C.GRAY}· 无需压缩{C.RESET}")
         return True
     if name == "/model":
         print(f"  {C.GRAY}model{C.RESET}      {config.model}")

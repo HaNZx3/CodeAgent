@@ -118,6 +118,46 @@ def test_maybe_compact_preserves_recent_turns():
     assert user_contents == ["t3", "t4"]
 
 
+def test_maybe_compact_return_codes():
+    """maybe_compact 返回结果码，供 /compact 区分展示。"""
+    # 轮次不足：user 轮数 <= keep_recent，无可压缩旧轮次
+    cm = ContextManager("sys", compact_threshold=1, keep_recent=6,
+                        summarizer=lambda m: "S")
+    cm.add_user("only")
+    cm.add_assistant(ModelResponse(text="a"))
+    assert cm.maybe_compact(force=True) == "few_turns"
+
+    # 幂等守卫：messages[1] 已是摘要
+    cm2 = ContextManager("sys", compact_threshold=1, keep_recent=1,
+                         summarizer=lambda m: "S")
+    cm2.messages.append({"role": "system",
+                         "content": "[Previous conversation summary]\nS"})
+    assert cm2.maybe_compact(force=True) == "already_summary"
+
+    # 压缩成功
+    cm3 = ContextManager("sys", compact_threshold=1, keep_recent=1,
+                         summarizer=lambda m: "S")
+    cm3.add_user("t1")
+    cm3.add_assistant(ModelResponse(text="a1"))
+    cm3.add_user("t2")
+    cm3.add_assistant(ModelResponse(text="a2"))
+    assert cm3.maybe_compact(force=True) == "ok"
+
+    # summarizer 异常：返回 failed 且保留原 messages
+    def boom(_m):
+        raise RuntimeError("summarizer down")
+
+    cm4 = ContextManager("sys", compact_threshold=1, keep_recent=1,
+                         summarizer=boom)
+    cm4.add_user("t1")
+    cm4.add_assistant(ModelResponse(text="a1"))
+    cm4.add_user("t2")
+    cm4.add_assistant(ModelResponse(text="a2"))
+    before = list(cm4.get_messages())
+    assert cm4.maybe_compact(force=True) == "failed"
+    assert cm4.get_messages() == before
+
+
 def test_maybe_compact_does_not_split_tool_call_pair():
     """关键回归：压缩切分不能切断 assistant(tool_calls)+tool 配对。
 
