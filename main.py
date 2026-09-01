@@ -312,6 +312,72 @@ def _cursor_row() -> int | None:
     return None
 
 
+def _select_picker(title: str, items: list[tuple[str, str]],
+                   hint: str = "↑↓ 选择，数字快捷，Enter 确认，Esc 取消") -> int | None:
+    """终端单选器（Windows TTY）：↑↓ 选择 / 数字快捷 / Enter 确认 / Esc 取消。
+
+    items: [(main_text, suffix_text), ...]，suffix 是灰色附加信息（如快照标记）。
+    返回选中索引（0-based）；取消返回 None。非 TTY 回退 input()。
+    """
+    if not (sys.platform == "win32" and sys.stdin.isatty()):
+        print(title)
+        for i, (main, suffix) in enumerate(items, 1):
+            print(f"  {i}  {main}  {C.GRAY}{suffix}{C.RESET}")
+        try:
+            s = input(f"{C.GRAY}输入编号（回车取消）{C.RESET} ").strip()
+        except EOFError:
+            return None
+        return int(s) - 1 if s.isdigit() and 1 <= int(s) <= len(items) else None
+
+    import msvcrt
+
+    n = len(items)
+    sel = 0
+    # 总行数 = title + items + hint，用于光标定位
+    total_lines = 1 + n + 1
+
+    def _draw() -> None:
+        """重绘菜单；光标回到第一行（title）。"""
+        out = [f"\r\033[J{title}"]
+        for i, (main, suffix) in enumerate(items):
+            mark = f"{C.BOLD}{C.CYAN}❯{C.RESET}" if i == sel else " "
+            out.append(f"  {mark} {C.BOLD}{i + 1}{C.RESET}  {main}"
+                       f"  {C.GRAY}{suffix}{C.RESET}" if suffix else
+                       f"  {mark} {C.BOLD}{i + 1}{C.RESET}  {main}")
+        out.append(f"{C.GRAY}{hint}{C.RESET}")
+        sys.stdout.write("\n".join(out))
+        # 光标回第一行：上移 total_lines - 1 行
+        sys.stdout.write(f"\r\033[{total_lines - 1}A")
+        sys.stdout.flush()
+
+    _draw()
+    while True:
+        ch = msvcrt.getwch()
+        if ch == "\r":  # Enter 确认
+            # 移到最后一行之后，清屏，留出后续输出空间
+            sys.stdout.write(f"\r\033[{total_lines - 1}B\n\033[J")
+            sys.stdout.flush()
+            return sel
+        if ch == "\x1b":  # Esc 取消
+            sys.stdout.write(f"\r\033[{total_lines - 1}B\n\033[J")
+            sys.stdout.flush()
+            return None
+        if ch == "\x03":  # Ctrl+C
+            sys.stdout.write(f"\r\033[{total_lines - 1}B\n\033[J")
+            raise KeyboardInterrupt
+        if ch in ("\xe0", "\x00"):  # 方向键前缀
+            nxt = msvcrt.getwch()
+            if nxt == "H":  # ↑
+                sel = max(sel - 1, 0)
+                _draw()
+            elif nxt == "P":  # ↓
+                sel = min(sel + 1, n - 1)
+                _draw()
+        elif ch.isdigit() and 1 <= int(ch) <= n:
+            sel = int(ch) - 1
+            _draw()
+
+
 def _readline(prompt: str, status=None) -> str:
     """读取一行输入（Claude Code 式交互）。
 
@@ -514,22 +580,16 @@ def _handle_back(agent: CodingAgent, arg: str) -> None:
     if arg.isdigit() and 1 <= int(arg) <= len(turns):
         n = int(arg)  # /back <n> 直接回退，跳过候选菜单
     else:
-        print(f"{C.CYAN}回退到哪条消息之前？{C.RESET}")
-        for i, idx in enumerate(turns, 1):
+        items: list[tuple[str, str]] = []
+        for i, idx in enumerate(turns):
             preview = _shorten((msgs[idx].get("content") or "").splitlines()[0], 46)
-            mark = ""
-            if use_ckpt:
-                mark = f"  {C.GRAY}[快照 {ck.entries()[i - 1]['commit'][:7]}]{C.RESET}"
-            print(f"  {C.BOLD}{i}{C.RESET}  {preview}{mark}")
-        try:
-            choice = input(f"{C.GRAY}输入编号（回车取消）{C.RESET} ").strip()
-        except EOFError:
-            return
-        if choice.isdigit() and 1 <= int(choice) <= len(turns):
-            n = int(choice)
-        else:
+            mark = f"[快照 {ck.entries()[i]['commit'][:7]}]" if use_ckpt else ""
+            items.append((preview, mark))
+        picked = _select_picker(f"{C.CYAN}回退到哪条消息之前？{C.RESET}", items)
+        if picked is None:
             print(f"{C.GRAY}已取消{C.RESET}")
             return
+        n = picked + 1
     idx = turns[n - 1]
 
     # ── 代码还原（先于对话截断）──
