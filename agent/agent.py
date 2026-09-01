@@ -162,10 +162,12 @@ class CodingAgent:
         self.switch_session(sid)
         return sid
 
-    def run(self, task: str, on_step=None, on_text=None, on_step_start=None) -> RunResult:
+    def run(self, task, on_step=None, on_text=None, on_step_start=None,
+            on_tool_call_start=None) -> RunResult:
         # 每轮任务开始前打代码快照（供 /back 还原到「这条消息发出前」）。
         # 快照内部吞掉一切 git 异常并自动降级，绝不阻塞任务主流程。
         self.checkpoints.snapshot(task)
         return self.loop.run(
-            task, on_step=on_step, on_text=on_text, on_step_start=on_step_start
+            task, on_step=on_step, on_text=on_text, on_step_start=on_step_start,
+            on_tool_call_start=on_tool_call_start,
         )

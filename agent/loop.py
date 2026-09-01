@@ -65,6 +65,7 @@ class AgentLoop:
         on_step: Callable[[StepRecord], None] | None = None,
         on_text: Callable[[str], None] | None = None,
         on_step_start: Callable[[str, dict], None] | None = None,
+        on_tool_call_start: Callable[[], None] | None = None,
     ) -> RunResult:
         """执行一次完整任务，返回最终回答或停止原因。
 
@@ -77,6 +78,10 @@ class AgentLoop:
 
         on_step_start 可选：工具开始执行前回调（带工具名与参数），
         供 CLI 在工具执行期间显示 spinner 等加载状态。
+
+        on_tool_call_start 可选（流式）：模型文本输出完后开始生成
+        tool_call 参数时回调。填补「文本完 → 工具开始执行」之间的
+        视觉空档，期间参数分片接收可能持续数秒，否则 CLI 看起来像卡住。
         """
         self.context.add_user(task)
         # 压缩在 stop.start() 之前：summarizer 的 LLM 调用不计入 max_runtime；
@@ -101,9 +106,14 @@ class AgentLoop:
                 )
 
             # 调用 LLM。LLM 出错时不直接崩溃，而是作为停止原因返回。
-            # FakeLLM 等自定义 chat 不认识 on_text 参数，仅在开启流式时才传。
+            # FakeLLM 等自定义 chat 不认识 on_text/on_tool_call_start 参数，
+            # 仅在开启对应回调时才传，避免接口不兼容。
             try:
-                kwargs = {"on_text": on_text} if on_text else {}
+                kwargs: dict = {}
+                if on_text:
+                    kwargs["on_text"] = on_text
+                if on_tool_call_start:
+                    kwargs["on_tool_call_start"] = on_tool_call_start
                 response = self.llm.chat(
                     self.context.get_messages(), self.registry.schemas(), **kwargs
                 )

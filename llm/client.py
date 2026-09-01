@@ -67,12 +67,18 @@ class LLMClient:
         messages: list,
         tools: list | None = None,
         on_text: Callable[[str], None] | None = None,
+        on_tool_call_start: Callable[[], None] | None = None,
     ) -> ModelResponse:
         """调用模型并返回标准化响应。
 
         on_text 提供时走流式接口：每个文本增量实时回调（打字机效果），
         结束后仍返回完整统一的 ModelResponse；工具调用参数按分片拼装，
         对上层完全透明——无论是否流式，Agent Loop 拿到的结构一模一样。
+
+        on_tool_call_start 可选（仅流式）：模型文本输出完后开始生成
+        tool_call 参数分片时调用一次。这段「参数接收期」可能持续数秒
+        （write_file 几百行代码），期间既无文本也无工具执行，没有这个
+        回调的话 CLI 会看起来像卡住——重启 spinner 填补这段空档。
         """
         params: dict = {"model": self.model, "messages": messages}
         if tools:
@@ -94,6 +100,8 @@ class LLMClient:
         # 工具调用的 id/name 首包出现，arguments 可能拆成多个分片，按 index 归槽拼接。
         acc: dict[int, dict] = {}
         stream_usage = None
+        # 仅在首个 tool_call 分片到达时触发一次，避免每个分片都重启 spinner。
+        tool_call_notified = False
         for chunk in self._create_with_retry(params):
             # usage 可能出现在任意 chunk（通常最后一个），且该 chunk 可能无 choices。
             chunk_usage = getattr(chunk, "usage", None)
@@ -107,6 +115,12 @@ class LLMClient:
                 text_parts.append(content)
                 on_text(content)
             for frag in getattr(delta, "tool_calls", None) or []:
+                # 文本输出完后开始接收 tool_call 参数——这段「参数接收期」
+                # 可能持续数秒，期间没有文本回调，CLI 会看起来像卡住。
+                # 在首个分片到达时通知一次，让 CLI 重启 spinner 填补空档。
+                if not tool_call_notified and on_tool_call_start:
+                    on_tool_call_start()
+                    tool_call_notified = True
                 idx = getattr(frag, "index", 0)
                 slot = acc.setdefault(idx, {"id": "", "name": "", "args": ""})
                 if frag.id:

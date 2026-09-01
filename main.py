@@ -131,6 +131,16 @@ class _TurnView:
         self._newline()
         self._spinner.start(f"Running {tool_name}…")
 
+    def tool_call_start(self) -> None:
+        """流式模式下，模型文本输出完后开始生成 tool_call 参数时调用。
+
+        填补「文本完 → 工具开始执行」之间的视觉空档：tool_call 参数
+        分片接收可能持续数秒（write_file 几百行代码），期间既无文本
+        也无工具执行，不重启 spinner 的话 CLI 看起来像卡住。
+        """
+        self._newline()
+        self._spinner.start("Generating tool call…")
+
     def step(self, rec: StepRecord) -> None:
         self._spinner.stop()
         self._newline()
@@ -805,6 +815,7 @@ def _run_once(agent: CodingAgent, task: str) -> None:
             on_step=view.step,
             on_text=view.text,
             on_step_start=view.step_start,
+            on_tool_call_start=view.tool_call_start,
         )
     except KeyboardInterrupt:
         # Ctrl+C：打断当前思考 / 工具执行，返回（一次性模式即结束）。
@@ -860,6 +871,7 @@ def _run_repl(agent: CodingAgent, config: Config) -> None:
                 on_step=view.step,
                 on_text=view.text,
                 on_step_start=view.step_start,
+                on_tool_call_start=view.tool_call_start,
             )
         except KeyboardInterrupt:
             # Ctrl+C：打断当前思考 / 工具执行，停 spinner 后回到输入栏。
