@@ -325,6 +325,9 @@ def _readline(prompt: str, status=None) -> str:
     buf = ""
     sel = 0            # 菜单当前选中项
     esc_closed = False  # Esc 后暂时关闭菜单，直到输入变化
+    # 上次 _draw 渲染的总行数（输入行 + 菜单行）；下次 _draw 开头据此上移回第一行，
+    # 否则多行重绘会从最后一行开始，导致整屏错位。
+    last_total_rows = [1]
 
     def _matches() -> list[str]:
         # 多行输入（含 \n）时关闭命令菜单——菜单只在单行 / 命令模式有意义。
@@ -357,6 +360,12 @@ def _readline(prompt: str, status=None) -> str:
 
         buf 含 \n 时按多行渲染：第一行跟 prompt，后续每行独立成行；
         多行模式下命令菜单、ghost 预览、右下角状态栏均不显示。
+
+        光标轨迹（关键，错一行就整屏错位）：
+          开头：先上移 last_total_rows-1 行回第一行（上次渲染后光标停在最后一行）；
+          渲染：第一行带 prompt，后续行 \n\r\033[K+line，菜单 \033[B\r\033[K+row；
+          清屏：\033[B 下移 1 行 + \033[J 清到屏幕尾（删掉比上一帧多出来的行）；
+          定位：上移 1+len(ms) 行回最后一行，移到 col 列（1 = 清屏下移的那行）。
         """
         lines = buf.split("\n")
         multi = len(lines) > 1
@@ -364,6 +373,11 @@ def _readline(prompt: str, status=None) -> str:
         ghost = "" if multi else _ghost()
         # col = 最后一行 buf 末尾列号（prompt 只在第一行；ghost 不占光标位）
         col = 1 + (prompt_w if not multi else 0) + _disp_width(lines[-1])
+
+        # 上移回第一行：上次渲染后光标停在最后一行末尾
+        if last_total_rows[0] > 1:
+            sys.stdout.write(f"\033[{last_total_rows[0] - 1}A")
+
         out = ["\r\033[K", prompt, lines[0]]
         if ghost:
             out += [C.GRAY, ghost, C.RESET]
@@ -383,8 +397,9 @@ def _readline(prompt: str, status=None) -> str:
                 sys.stdout.write(f"\033[B\r\033[K{row}")
         # 清掉比上一帧多出来的菜单/输入行（\033[J 从光标清到屏幕尾）
         sys.stdout.write("\033[B\r\033[J")
-        # 上移回输入行起点：多行输入 + 菜单行数
-        sys.stdout.write(f"\r\033[{len(lines) + len(ms)}A\033[{col}G")
+        # 上移回最后一行（1 = 清屏下移的那行）+ 菜单行数；移到 col 列
+        sys.stdout.write(f"\r\033[{1 + len(ms)}A\033[{col}G")
+        last_total_rows[0] = len(lines) + len(ms)
         sys.stdout.flush()
 
     sys.stdout.write(prompt)
