@@ -327,7 +327,8 @@ def _readline(prompt: str, status=None) -> str:
     esc_closed = False  # Esc 后暂时关闭菜单，直到输入变化
 
     def _matches() -> list[str]:
-        if not buf.startswith("/") or " " in buf:
+        # 多行输入（含 \n）时关闭命令菜单——菜单只在单行 / 命令模式有意义。
+        if not buf.startswith("/") or " " in buf or "\n" in buf:
             return []
         exact = [c for c in COMMANDS if c == buf]
         return exact + [c for c in COMMANDS if c != buf and c.startswith(buf)]
@@ -339,8 +340,8 @@ def _readline(prompt: str, status=None) -> str:
         return ms[0][len(buf):]
 
     def _corner() -> str:
-        """右下角常驻状态；输入行右侧放不下时省略。"""
-        if status is None:
+        """右下角常驻状态；输入行右侧放不下时不显示；多行输入时不显示。"""
+        if status is None or "\n" in buf:
             return ""
         text = status()
         if not text:
@@ -352,14 +353,24 @@ def _readline(prompt: str, status=None) -> str:
         return " " * pad + C.GRAY + text + C.RESET
 
     def _draw() -> None:
-        """重绘输入行 + 菜单；光标回到 buf 末尾。"""
-        ms = [] if esc_closed else _matches()
-        ghost = _ghost()
-        col = 1 + prompt_w + _disp_width(buf)
-        out = ["\r\033[K", prompt, buf]
+        """重绘输入行 + 菜单；光标回到 buf 末尾。
+
+        buf 含 \n 时按多行渲染：第一行跟 prompt，后续每行独立成行；
+        多行模式下命令菜单、ghost 预览、右下角状态栏均不显示。
+        """
+        lines = buf.split("\n")
+        multi = len(lines) > 1
+        ms = [] if (esc_closed or multi) else _matches()
+        ghost = "" if multi else _ghost()
+        # col = 最后一行 buf 末尾列号（prompt 只在第一行；ghost 不占光标位）
+        col = 1 + (prompt_w if not multi else 0) + _disp_width(lines[-1])
+        out = ["\r\033[K", prompt, lines[0]]
         if ghost:
             out += [C.GRAY, ghost, C.RESET]
-        out.append(_corner())
+        if not multi:
+            out.append(_corner())
+        for line in lines[1:]:
+            out += ["\n\r\033[K", line]
         sys.stdout.write("".join(out))
         if ms:
             for i, cmd in enumerate(ms):
@@ -370,9 +381,10 @@ def _readline(prompt: str, status=None) -> str:
                 else:
                     row = f"{C.GRAY}  {cmd}  {desc}{C.RESET}"
                 sys.stdout.write(f"\033[B\r\033[K{row}")
-        # 清掉比上一帧多出来的菜单行（\033[J 从光标清到屏幕尾）
+        # 清掉比上一帧多出来的菜单/输入行（\033[J 从光标清到屏幕尾）
         sys.stdout.write("\033[B\r\033[J")
-        sys.stdout.write(f"\r\033[{len(ms) + 1}A\033[{col}G")
+        # 上移回输入行起点：多行输入 + 菜单行数
+        sys.stdout.write(f"\r\033[{len(lines) + len(ms)}A\033[{col}G")
         sys.stdout.flush()
 
     sys.stdout.write(prompt)
@@ -390,13 +402,19 @@ def _readline(prompt: str, status=None) -> str:
     while True:
         ms = [] if esc_closed else _matches()
         ch = msvcrt.getwch()
-        if ch in ("\r", "\n"):
-            # 回车：菜单打开时补全选中命令并执行
+        if ch == "\r":  # Enter：提交（菜单打开时先补全选中命令）
+            # 多行 buf 也能直接回车提交；菜单打开时补全选中项
             if ms:
                 buf = ms[min(sel, len(ms) - 1)]
             sys.stdout.write("\r\033[K" + prompt + buf + "\n\033[J")
             sys.stdout.flush()
             return buf
+        if ch == "\n":  # Ctrl+J：插入换行（多行输入）
+            buf += "\n"
+            esc_closed = False
+            sel = 0
+            _draw()
+            continue
         if ch == "\t":
             if ms:
                 buf = ms[min(sel, len(ms) - 1)]
@@ -774,7 +792,8 @@ def _run_once(agent: CodingAgent, task: str) -> None:
 
 
 def _run_repl(agent: CodingAgent, config: Config) -> None:
-    print(f"{C.GRAY}输入任务开始，/help 查看命令，/exit 退出；运行中按 Ctrl+C 中断{C.RESET}\n")
+    print(f"{C.GRAY}输入任务开始，/help 查看命令，/exit 退出；"
+          f"多行输入按 Ctrl+J 换行，运行中按 Ctrl+C 中断{C.RESET}\n")
     # 输入栏右下角常驻状态的数据：全部取自 API 返回的真实 usage。
     # ctx = 最近一次调用的 prompt_tokens（即当前上下文规模），
     # total = 本会话累计消耗 tokens。
